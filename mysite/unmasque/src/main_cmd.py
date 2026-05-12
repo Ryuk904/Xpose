@@ -1186,6 +1186,27 @@ and o1.o_orderdate between date '1995-01-01' and date '1995-12-31'
 and o2.o1_orderdate between date '1995-01-01' and date '1995-12-31'
 group by c_address;""", False, True, False, False),
 
+                     # control: a plain conjunctive query (no disjunction) on a small table.
+                     TestQuery("DISJ0",
+                               "select n_name from nation where n_nationkey between 5 and 18;",
+                               False, False, False, False, False),
+
+                     # a simple disjunctive-range query (the disjunction-refiner smoke test).
+                     # Hidden predicate has a gap (6..9) that the plain binary-search extractor
+                     # over-approximates as `between 1 and 15`; with the OR flag on, the refiner
+                     # should recover `between 1 and 5 OR between 10 and 15`. The disjunction
+                     # column is also projected here, to exercise the projection-of-OR-column path.
+                     TestQuery("DISJ1",
+                               "select n_nationkey, n_name from nation "
+                               "where n_nationkey between 1 and 5 or n_nationkey between 10 and 15;",
+                               False, False, False, False, True),
+
+                     # the motivating example, on a big table.
+                     TestQuery("DISJ2",
+                               "select l_shipmode from lineitem "
+                               "where l_quantity between 10 and 20 or l_quantity between 30 and 40;",
+                               False, False, False, False, True),
+
                      ]
     return test_workload
 

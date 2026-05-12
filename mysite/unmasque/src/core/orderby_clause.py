@@ -302,9 +302,18 @@ class OrderBy(GenerationPipeLineBase):
         if datatype != 'date':
             datatype = 'int'
         if (tabname_inner, attrib_inner) in self.filter_attrib_dict.keys():
-            first = self.filter_attrib_dict[(tabname_inner, attrib_inner)][0]
-            second = min(get_val_plus_delta(datatype, first, 1),
-                         self.filter_attrib_dict[(tabname_inner, attrib_inner)][1])
+            fv = self.filter_attrib_dict[(tabname_inner, attrib_inner)]
+            lo = fv[0]
+            hi = fv[1] if len(fv) > 1 else fv[0]
+            # An OR/IN predicate stores its alternatives as a list of (lb, ub) interval
+            # tuples (or scalars); reduce to scalar bounds inside one satisfying interval
+            # so the two probe instances stay valid (and the arithmetic below works).
+            if isinstance(lo, (tuple, list)):
+                lo = lo[0]
+            if isinstance(hi, (tuple, list)):
+                hi = hi[-1]
+            first = lo
+            second = min(get_val_plus_delta(datatype, first, 1), hi)
         else:
             first = get_unused_dummy_val(datatype, self.values_used)
             second = get_val_plus_delta(datatype, first, 1)

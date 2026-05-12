@@ -10,7 +10,10 @@ class OuterJoinPipeLine(ExtractionPipeLine):
         self.pipeLineError = False
 
     def _after_from_clause_extract(self, query, core_relations):
-        eq = super()._after_from_clause_extract(query, core_relations)
+        # run the SPJGAOL+NEP core, then add the outer-join structure, then refine
+        # disjunctions on the fully assembled query (an over-loose ON-clause filter is
+        # just another atom for the refiner).
+        eq = self._extract_spjgaol(query, core_relations)
         if eq is None:
             return None
 
@@ -30,4 +33,4 @@ class OuterJoinPipeLine(ExtractionPipeLine):
             self.logger.info("No outer join")
         if oj.Q_E is not None:
             eq = oj.Q_E
-        return eq
+        return self._refine_disjunctions(query, core_relations, eq)

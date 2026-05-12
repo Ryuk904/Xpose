@@ -351,12 +351,25 @@ class Projection(GenerationPipeLineBase):
 
     def __assign_next_s_value_for_or_attrib(self, used_vals, tab_attrib):
         in_vals = self.or_predicates_dict[tab_attrib]
-        for val in in_vals:
-            if in_vals not in used_vals:
-                used_vals.append(val)
-                return val
-        self.logger.error("Insufficient s-value options!")
-        return None
+        # `in_vals` lists the alternatives of an OR/IN predicate on this column. Each item
+        # is either a scalar (e.g. `n_nationkey IN (1, 4, 7)`) or an (lb, ub) interval
+        # tuple (e.g. `n_nationkey between 1 and 5 OR between 10 and 15`). Flatten to
+        # candidate scalar values that satisfy the predicate and pick one not used yet.
+        candidates = []
+        for v in in_vals:
+            if isinstance(v, (tuple, list)) and len(v) == 2:
+                lb, ub = v[0], v[1]
+                candidates.append(lb)
+                if ub != lb:
+                    candidates.append(ub)
+            else:
+                candidates.append(v)
+        for v in candidates:
+            if v not in used_vals:
+                used_vals.append(v)
+                return v
+        self.logger.debug("No fresh s-value option for OR attribute; reusing the first candidate.")
+        return candidates[0] if candidates else None
 
     def __assign_s_val_in_coeffMatrix(self, coeff, j, key, outer_idx):
         mini = constants.pr_min
@@ -374,6 +387,12 @@ class Projection(GenerationPipeLineBase):
         else:
             self.logger.debug(f"mini: {mini}, maxi: {maxi}")
             s_val = random.randrange(math.floor(mini), math.ceil(maxi))
+        # `coeff` is a float matrix, so the s-value must be a plain scalar (never an
+        # interval tuple or None).
+        if isinstance(s_val, (tuple, list)):
+            s_val = s_val[0] if len(s_val) else None
+        if s_val is None:
+            s_val = self.get_dmin_val(key[1], key[0])
         self.logger.debug(f"s-value for {key} is {s_val}, assigned to coeff[{outer_idx}][{j}]")
         coeff[outer_idx][j] = s_val
 

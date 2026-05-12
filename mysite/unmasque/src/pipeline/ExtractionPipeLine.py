@@ -83,6 +83,28 @@ class ExtractionPipeLine(DisjunctionPipeLine,
         return eq
 
     def _after_from_clause_extract(self, query, core_relations):
+        eq = self._extract_spjgaol(query, core_relations)
+        if eq is None:
+            return None
+        return self._refine_disjunctions(query, core_relations, eq)
+
+    def _refine_disjunctions(self, query, core_relations, eq):
+        if not self.connectionHelper.config.detect_or:
+            return eq
+        try:
+            from ..core.disjunction_refiner import DisjunctionRefiner, make_filter_for_refiner
+            filter_extractor = self.filter_extractor
+            if filter_extractor is None:
+                gmi = self.genPipelineCtx.global_min_instance_dict if self.genPipelineCtx is not None else {}
+                filter_extractor = make_filter_for_refiner(self.connectionHelper, core_relations, gmi)
+            refiner = DisjunctionRefiner(self.connectionHelper, core_relations, self.q_generator, filter_extractor)
+            eq = refiner.refine(query, eq)
+            self.time_profile.update_for_refinement(refiner.local_elapsed_time, refiner.app_calls)
+        except Exception as e:
+            self.logger.error("Disjunction refinement step failed; keeping the extracted query as is.", str(e))
+        return eq
+
+    def _extract_spjgaol(self, query, core_relations):
 
         time_profile = create_zero_time_profile()
 

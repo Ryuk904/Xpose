@@ -362,6 +362,50 @@ class QueryStringGenerator:
         self._workingCopy.add_to_where_op(predicate)
         return self.write_query()
 
+    # ------------------------------------------------------------------ #
+    # Hooks used by the disjunction refiner (see core/disjunction_refiner.py)
+    # ------------------------------------------------------------------ #
+    def replace_range_with_intervals(self, tab, attrib, intervals):
+        """Replace the (tab, attrib, 'range', lb, ub) atom (or an existing IN atom on the
+        same column) with the given list of disjoint, sorted (lb, ub) intervals.
+        A single interval stays a plain range atom; multiple intervals become an IN atom
+        that QueryStringGenerator already knows how to render as
+        ``tab.attrib between .. and .. OR tab.attrib between .. and .. OR tab.attrib in (..)``."""
+        self._workingCopy.arithmetic_filters = [f for f in self._workingCopy.arithmetic_filters
+                                                if not (get_tab(f) == tab and get_attrib(f) == attrib
+                                                        and str(get_op(f)).lower() in ('range', 'in'))]
+        self._workingCopy.filter_in_predicates = [f for f in self._workingCopy.filter_in_predicates
+                                                  if not (get_tab(f) == tab and get_attrib(f) == attrib)]
+        if not intervals:
+            return
+        if len(intervals) == 1:
+            lb, ub = intervals[0]
+            self._workingCopy.arithmetic_filters.append((tab, attrib, 'range', lb, ub))
+            return
+        vlist = []
+        for lb, ub in intervals:
+            vlist.append(lb if lb == ub else (lb, ub))
+        self._workingCopy.filter_in_predicates.append((tab, attrib, 'IN', vlist, vlist))
+
+    def add_not_in_predicate(self, tab, attrib, values):
+        """Add a ``tab.attrib NOT IN (v1, v2, ...)`` atom (used to carve string leaks
+        out of an over-broad LIKE predicate)."""
+        if not values:
+            return
+        datatype = self.get_datatype((tab, attrib))
+        f_values = FrozenList([get_format(datatype, v) for v in values])
+        f_values.freeze()
+        entry = (tab, attrib, 'not in', f_values, f_values)
+        if entry not in self._workingCopy.filter_not_in_predicates:
+            self._workingCopy.filter_not_in_predicates.append(entry)
+
+    def rebuild_after_predicate_change(self) -> str:
+        """Regenerate only the WHERE clause from the (mutated) working copy and re-assemble
+        the query string. Select / group-by / order-by / limit are unaffected by predicate
+        edits, so they are left as-is."""
+        self._workingCopy.where_op = self.__generate_where_clause()
+        return self.write_query()
+
     def __generate_where_clause(self) -> str:
         predicates = []
         if not len(self._workingCopy.join_edges):
