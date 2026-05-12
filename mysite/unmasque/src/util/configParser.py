@@ -4,8 +4,8 @@ from pathlib import Path
 from .application_type import ApplicationType
 from .constants import DATABASE_SECTION, HOST, PORT, USER, PASSWORD, SCHEMA, DBNAME, \
     SUPPORT_SECTION, LEVEL, LOGGING_SECTION, FEATURE_SECTION, DETECT_UNION, DETECT_NEP, USE_CS2, DATABASE, DETECT_OR, \
-    DETECT_OJ, LIMIT, OPTIONS_SECTION, DOWN_SCALE, WORKING_SCHEMA, TABLE_SIZE_SECTION, TABLE, SCALE_FACTOR, SCALE_RETRY, \
-    USE_INDEX
+    DETECT_OJ, DETECT_MULTI, LIMIT, OPTIONS_SECTION, DOWN_SCALE, WORKING_SCHEMA, TABLE_SIZE_SECTION, TABLE, SCALE_FACTOR, \
+    SCALE_RETRY, USE_INDEX
 
 
 class Config:
@@ -40,6 +40,9 @@ class Config:
         self.detect_nep = False
         self.detect_or = False
         self.detect_oj = False
+        # Algorithm 1 (MultiplicityDetect): off by default so legacy behaviour
+        # and app-call counts are unchanged unless explicitly enabled.
+        self.detect_multi_instance = False
         self.use_cs2 = False
         self.scale_down = False
         self.app_type = ApplicationType.SQL_ERR_FWD
@@ -116,6 +119,13 @@ class Config:
             self.detect_oj = False
         elif detect_oj.lower() == "yes":
             self.detect_oj = True
+
+        # Optional; absent from older config files -> stays disabled.
+        detect_multi = config_object.get(FEATURE_SECTION, DETECT_MULTI, fallback="no")
+        if detect_multi.lower() == "no":
+            self.detect_multi_instance = False
+        elif detect_multi.lower() == "yes":
+            self.detect_multi_instance = True
 
         self.load_optionals(config_object)
 

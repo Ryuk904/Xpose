@@ -76,9 +76,14 @@ class Minimizer(AppExtractorBase, ABC):
         if self.check_result_for_half(mid_ctid2, end_ctid, dirty_tab, tabname, query):
             # Take the lower half
             start_ctid = mid_ctid2
-        else:
-            # Take the upper half
+        elif self.check_result_for_half(start_ctid, mid_ctid1, dirty_tab, tabname, query):
+            # Take the upper half (only if it actually keeps Q_H FIT -- a multi-row
+            # witness, e.g. a self-join, can straddle the split so that *neither*
+            # half works; taking a broken half used to abort the whole pipeline).
             end_ctid = mid_ctid1
+        else:
+            self.logger.error("Cannot halve anymore (a multi-row witness straddles the split).")
+            start_ctid, end_ctid = None, None
         return end_ctid, start_ctid
 
     def get_start_and_end_ctids(self, core_sizes, query, tabname, dirty_tab):

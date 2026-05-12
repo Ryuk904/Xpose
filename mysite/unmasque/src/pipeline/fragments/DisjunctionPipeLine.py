@@ -6,8 +6,13 @@ from ...util.constants import UNMASQUE
 from ....src.core.aoa import InequalityPredicate
 from ....src.core.cs2 import Cs2
 from ....src.core.db_restorer import DbRestorer
+from ....src.core.alias_aware_minimizer import AliasAwareMinimizer
+from ....src.core.cross_alias_predicate import CrossAliasPredicate
+from ....src.core.per_alias_pinned_filter import PerAliasPinnedFilter
 from ....src.core.equi_join import U2EquiJoin
 from ....src.core.filter import Filter
+from ....src.core.multiplicity import MultiplicityDetect
+from ....src.core.per_alias_filter import PerAliasFilter
 from ....src.core.view_minimizer import ViewMinimizer
 from ....src.pipeline.abstract.generic_pipeline import GenericPipeLine
 from ....src.util.aoa_utils import get_constants_for
@@ -31,6 +36,27 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         self.db_restorer = None
         self.global_min_instance_dict = None
         self.key_lists = None
+        # mult(T) for every core relation -- detected after minimization
+        # (Algorithm 1 / MultiplicityDetect).  Defaults to 1 everywhere.
+        self.mult = {}
+        # Alias-aware D_min (Algorithm 2): {table -> [header, row, ...]} with
+        # mult(table) rows per multi-instance table.  None when not computed.
+        self.alias_aware_min_instance_dict = None
+        # Cross-alias predicates (Algorithm 3): {table -> [pred dict, ...]}.
+        self.cross_alias_predicates = {}
+        self.cross_alias_coupled_columns = {}
+        # Output-column -> (table, alias_index, source_col) from the discriminator
+        # run (the alias-lift of the projection extractor).
+        self.projection_alias_attribution = {}
+        # Per-alias filter bounds (Algorithm 4): {table -> {col -> {...}}}.
+        self.per_alias_filters = {}
+        # ... attributed to specific aliases by the discriminator probe (report §F):
+        # {table -> {alias_index -> {col -> {'lower':l,'upper':u}}}}.
+        self.per_alias_pinned_filters = {}
+        # Candidate multi-instance query string built by the alias-aware assembler,
+        # and whether it verified against the database (True/False/None).
+        self.alias_aware_query = None
+        self.alias_aware_query_verified = None
 
     def _mutation_pipeline(self, core_relations, query, time_profile, restore_details=None):
         self.update_state(RESTORE_DB + START)
@@ -67,11 +93,34 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         else:
             self.info[SAMPLING] = {'sample': cs2.sample, 'size': cs2.sizes}
 
+        '''
+        Multi-Instance (self-join) detection -- Algorithm 1, run BEFORE minimization
+        (on the sampled DB) so the minimizer can keep at least mult(R) rows for a
+        k-way self-join instead of collapsing it.  Opt-in ([feature] multi_instance);
+        failures here never abort the pipeline (mult just stays 1 everywhere).
+        '''
+        self.mult = {tab: 1 for tab in core_relations}
+        if getattr(self.connectionHelper.config, "detect_multi_instance", False):
+            try:
+                md = MultiplicityDetect(self.connectionHelper, core_relations)
+                md.doJob(query)
+                self.mult = dict(md.mult)
+                self.info['MULTIPLICITY'] = {'mult': dict(md.mult), 'method': dict(md.method_used),
+                                             'ambiguous': sorted(md.ambiguous)}
+                if any(v > 1 for v in self.mult.values()):
+                    self.logger.info("Detected multi-instance relations: " +
+                                     ", ".join(f"{t} x{k}" for t, k in self.mult.items() if k > 1))
+            except Exception as e:
+                self.logger.error("MultiplicityDetect stage failed; assuming mult=1 for all relations.", str(e))
+                self.mult = {tab: 1 for tab in core_relations}
+
         """
             View based Database Minimization
             """
         self.update_state(DB_MINIMIZATION + START)
         vm = ViewMinimizer(self.connectionHelper, core_relations, self.db_restorer.last_restored_size, cs2.passed)
+        # per-table floor: a k-way self-join keeps >= k rows in the (live) D_min.
+        vm.min_rows = {t: int(k) for t, k in self.mult.items() if int(k) > 1}
         self.update_state(DB_MINIMIZATION + RUNNING)
         try:
             check = vm.doJob(query)
@@ -90,6 +139,134 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         self.db_restorer.update_last_restored_size(vm.all_sizes)
         self.info[DB_MINIMIZATION] = vm.global_min_instance_dict
         self.global_min_instance_dict = copy.deepcopy(vm.global_min_instance_dict)
+
+        # The floored minimizer leaves >= mult(R) rows in a multi-instance table.
+        # global_min_instance_dict keeps the full k-row witness set (Algorithms 2-4 use
+        # it), but the *live* table (and its D_min copy) are re-collapsed to the first row
+        # so the (not yet alias-aware) Filter / equi-join / AOA / generation extractors keep
+        # seeing a single witness row, exactly as in the legacy pipeline.
+        if getattr(self.connectionHelper.config, "detect_multi_instance", False) \
+                and any(int(k) > 1 for k in self.mult.values()):
+            try:
+                self.connectionHelper.execute_sql(
+                    [f"set search_path='{self.connectionHelper.config.schema}';"])
+                q = self.connectionHelper.queries
+                for tab, k in self.mult.items():
+                    cur = self.global_min_instance_dict.get(tab)
+                    if int(k) <= 1 or not cur or len(cur) <= 2:
+                        continue
+                    fq = f"{self.connectionHelper.config.schema}.{tab}"
+                    attribs = "(" + ", ".join(str(c) for c in cur[0]) + ")"
+                    self.connectionHelper.execute_sql([q.truncate_table(fq)])
+                    self.connectionHelper.execute_sql_with_params(
+                        q.insert_into_tab_attribs_format(attribs, "", fq), [tuple(cur[1])])
+                    self.connectionHelper.execute_sql(
+                        [q.drop_table_cascade(q.get_dmin_tabname(tab)),
+                         q.create_table_as_select_star_from(q.get_dmin_tabname(tab), tab)])
+            except Exception as e:
+                self.logger.error("could not re-collapse multi-instance tables to a single row.", str(e))
+
+        '''
+        Alias-aware processing of the multi-instance relations -- Algorithms 2-4 + the
+        per-(alias, attribute) probe.  mult(R) was detected *before* minimization (above)
+        and used as the per-table floor, so the live D_min now keeps >= mult(R) rows for
+        each multi-instance table.  Opt-in ([feature] multi_instance); purely additive.
+        '''
+        if getattr(self.connectionHelper.config, "detect_multi_instance", False):
+            '''
+            Alias-aware k-coloured halving -- Algorithm 2.
+            For every relation with mult >= 2, compute a k-row witness set on
+            which Q_H is still FIT.  Published as self.alias_aware_min_instance_dict
+            for Algorithms 3 & 4; does NOT disturb the legacy single-row D_min that
+            the (not-yet-alias-aware) downstream extractors consume.
+            '''
+            if any(v > 1 for v in self.mult.values()):
+                try:
+                    aam = AliasAwareMinimizer(self.connectionHelper, core_relations,
+                                              self.mult, self.global_min_instance_dict)
+                    aam.doJob(query)
+                    self.alias_aware_min_instance_dict = dict(aam.alias_aware_min_instance_dict)
+                    self.info['ALIAS_AWARE_DMIN'] = {
+                        'sizes': {t: max(0, len(v) - 1) for t, v in self.alias_aware_min_instance_dict.items()
+                                  if v is not None},
+                        'witnessed': sorted(aam.expanded),
+                        'fallback': sorted(aam.fallback)}
+                    self.logger.info("Alias-aware D_min built for: " +
+                                     ", ".join(f"{t} x{self.mult[t]}" for t in self.mult if self.mult[t] > 1))
+                    self.logger.info("NOTE: downstream predicate extraction is not yet alias-aware "
+                                     "(Algorithm 4 pending); the extracted query may still collapse "
+                                     "per-alias filters / HAVING.")
+                except Exception as e:
+                    self.logger.error("AliasAwareMinimizer stage failed; alias-aware D_min not built.", str(e))
+                    self.alias_aware_min_instance_dict = None
+
+            '''
+            Cross-alias predicate extraction -- Algorithm 3.
+            Recovers intra-alias self-equi-joins (t.c = t.c') and same-column
+            inter-alias predicates (t_p.c REL t_q.c).  Published on
+            self.cross_alias_predicates for the (still to be made alias-aware)
+            query assembler.  Purely additive.
+            '''
+            if self.alias_aware_min_instance_dict and any(v > 1 for v in self.mult.values()):
+                try:
+                    cap = CrossAliasPredicate(self.connectionHelper, core_relations,
+                                              self.mult, self.alias_aware_min_instance_dict)
+                    cap.doJob(query)
+                    self.cross_alias_predicates = dict(cap.cross_alias_predicates)
+                    self.cross_alias_coupled_columns = dict(cap.coupled_columns)
+                    self.projection_alias_attribution = dict(cap.output_attribution)
+                    self.info['CROSS_ALIAS_PREDICATES'] = {
+                        'predicates': dict(cap.cross_alias_predicates),
+                        'coupled_columns': dict(cap.coupled_columns),
+                        'output_attribution': dict(cap.output_attribution),
+                        'notes': dict(cap.notes)}
+                    for t, ps in self.cross_alias_predicates.items():
+                        if ps:
+                            self.logger.info(f"cross-alias predicates [{t}]: {ps}")
+                except Exception as e:
+                    self.logger.error("CrossAliasPredicate stage failed; no cross-alias predicates.", str(e))
+                    self.cross_alias_predicates = {}
+
+            '''
+            Per-alias filter extraction -- Algorithm 4.
+            Recovers per-alias filter bounds on a multi-instance table's columns
+            via a cardinality-step search.  Published on self.per_alias_filters.
+            (Per-alias HAVING is left as future work.)  Purely additive.
+            '''
+            if any(v > 1 for v in self.mult.values()):
+                try:
+                    paf = PerAliasFilter(self.connectionHelper, core_relations, self.mult,
+                                         self.global_min_instance_dict, self.cross_alias_predicates)
+                    paf.doJob(query)
+                    self.per_alias_filters = dict(paf.per_alias_filters)
+                    self.info['PER_ALIAS_FILTERS'] = {'filters': dict(paf.per_alias_filters),
+                                                      'notes': dict(paf.notes)}
+                    for t, cols in self.per_alias_filters.items():
+                        if cols:
+                            self.logger.info(f"per-alias filters [{t}]: {cols}")
+                except Exception as e:
+                    self.logger.error("PerAliasFilter stage failed; no per-alias filters.", str(e))
+                    self.per_alias_filters = {}
+
+            '''
+            Per-(alias, attribute) discriminator probe (report §F) -- attributes the
+            per-alias filter bounds to specific aliases when an inter-alias chain pins
+            them.  Published on self.per_alias_pinned_filters.  Purely additive.
+            '''
+            if self.per_alias_filters and self.cross_alias_predicates and self.alias_aware_min_instance_dict:
+                try:
+                    papf = PerAliasPinnedFilter(self.connectionHelper, core_relations, self.mult,
+                                                self.alias_aware_min_instance_dict,
+                                                self.cross_alias_predicates, self.per_alias_filters)
+                    papf.doJob(query)
+                    self.per_alias_pinned_filters = dict(papf.pinned_filters)
+                    self.info['PER_ALIAS_PINNED_FILTERS'] = {'pinned': dict(papf.pinned_filters),
+                                                             'notes': dict(papf.notes)}
+                    for t, by_a in self.per_alias_pinned_filters.items():
+                        self.logger.info(f"pinned per-alias filters [{t}]: {by_a}")
+                except Exception as e:
+                    self.logger.error("PerAliasPinnedFilter stage failed; no pinned bounds.", str(e))
+                    self.per_alias_pinned_filters = {}
 
         '''
         Constant Filter Extraction

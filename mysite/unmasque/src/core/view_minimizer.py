@@ -27,6 +27,14 @@ class ViewMinimizer(Minimizer):
         super().__init__(connectionHelper, core_relations, all_sizes, "View_Minimizer")
         self.cs2_passed = sampling_status
         self.global_min_instance_dict = {}
+        # Per-table floor for intra-page halving (table -> min rows).  Empty by
+        # default => every table is shrunk to 1 row, as before.  When the
+        # multi-instance restructure is in effect this is set to mult(R) so a
+        # k-way self-join is not collapsed below k rows.
+        self.min_rows = {}
+
+    def min_rows_for(self, tab):
+        return max(self.max_row_no, int(self.min_rows.get(tab, self.max_row_no)))
 
     def doActualJob(self, args=None):
         query = self.extract_params_from_args(args)
@@ -120,8 +128,18 @@ class ViewMinimizer(Minimizer):
         return True
 
     def do_intraPage_copyBased_binary_halving(self, core_sizes, query, tabname, dirty_tab):
-        while int(core_sizes[tabname]) > self.max_row_no:
+        while int(core_sizes[tabname]) > self.min_rows_for(tabname):
             end_ctid, start_ctid = self.get_start_and_end_ctids(core_sizes, query, tabname, dirty_tab)
+            if end_ctid is None or start_ctid is None:
+                # Cannot halve any further -- a multi-row witness (e.g. a self-join)
+                # straddles the split.  Restore the table from its renamed-away copy
+                # (a no-op if it is already back) and stop here with a multi-row D_min.
+                self.connectionHelper.execute_sql([self.connectionHelper.queries.alter_table_rename_to(
+                    self.get_fully_qualified_table_name(dirty_tab), tabname)])
+                core_sizes[tabname] = self.connectionHelper.execute_sql_fetchone_0(
+                    self.connectionHelper.queries.get_row_count(
+                        self.get_fully_qualified_table_name(tabname)), self.logger)
+                break
             core_sizes = self.update_with_remaining_size(core_sizes, end_ctid, start_ctid, tabname, dirty_tab)
         return core_sizes
 

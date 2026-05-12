@@ -79,8 +79,37 @@ class ExtractionPipeLine(DisjunctionPipeLine,
         self.global_pk_dict = fc.init.global_pk_dict
 
         eq = self._after_from_clause_extract(query, self.core_relations)
+        self._build_alias_aware_query(query, eq)
         self.connectionHelper.closeConnection()
         return eq
+
+    def _build_alias_aware_query(self, query, eq):
+        """Best-effort multi-instance reconstruction of the extracted query (then
+        verified against the database), stored on self.alias_aware_query /
+        self.alias_aware_query_verified.  Opt-in ([feature] multi_instance) and purely
+        additive -- failures never affect the legacy result eq."""
+        if eq is None or not getattr(self.connectionHelper.config, "detect_multi_instance", False):
+            return
+        if not any(int(v) > 1 for v in (self.mult or {}).values()):
+            return
+        try:
+            from ..core.alias_aware_assembler import AliasAwareAssembler
+            aaa = AliasAwareAssembler(self.connectionHelper, self.core_relations, self.mult,
+                                      self.cross_alias_predicates, self.per_alias_filters,
+                                      self.cross_alias_coupled_columns,
+                                      self.projection_alias_attribution,
+                                      self.per_alias_pinned_filters)
+            aaa.doJob(query, eq)
+            self.alias_aware_query = aaa.alias_aware_query
+            self.alias_aware_query_verified = aaa.verified
+            self.info['ALIAS_AWARE_QUERY'] = {'query': aaa.alias_aware_query,
+                                              'verified': aaa.verified, 'notes': aaa.notes}
+            if aaa.alias_aware_query:
+                tag = {True: " [VERIFIED]", False: " [UNVERIFIED -- best-effort]"}.get(aaa.verified, "")
+                self.logger.info(f"candidate alias-aware (multi-instance) query{tag}:\n"
+                                 + aaa.alias_aware_query)
+        except Exception as e:
+            self.logger.error("Alias-aware assembler failed; only the legacy query is reported.", str(e))
 
     def _after_from_clause_extract(self, query, core_relations):
         eq = self._extract_spjgaol(query, core_relations)
