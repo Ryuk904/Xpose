@@ -1,35 +1,83 @@
 """
-Per-(alias, attribute) discriminator probe (report section F, lines 15-21).
+Per-(alias, attribute) discriminator probe (report section F).
 
-Algorithm 4 (:mod:`per_alias_filter`) recovers the *set* of per-alias filter bounds
-on a column, but not which alias owns which bound -- because, with the aliases free
-w.r.t. that column, the assignment is observationally irrelevant (a ``t1 <-> t2``
-relabel is a no-op).  When an *inter-alias chain* on some column ``d`` pins the
-aliases to specific rows, though, the assignment *is* identifiable: discriminate
-``d`` (give the k rows of the alias-aware D_min distinct, ascending values), so the
-chain ``t_{a1}.d < t_{a2}.d < ...`` forces alias ``a_i`` onto the i-th-smallest-``d``
-row; then a *targeted mutation* of that row reveals alias ``a_i``'s bound on every
-other column.
+Algorithm 4 (:mod:`per_alias_filter`) recovers the *multiset* of per-alias filter
+bounds on a column, but not which alias owns which -- because, with the aliases
+free w.r.t. that column, the assignment is observationally irrelevant (a
+``t1 <-> t2`` relabel is a no-op).  When an *inter-alias chain* on some column
+``d`` pins the aliases to specific rows (``t_{a1}.d < t_{a2}.d < ... < t_{ak}.d``,
+``k`` distinct ascending values), though, the assignment *is* identifiable:
 
-v1 handles the clean ``k = 2`` case with a single confirming probe: for a column ``c``
-whose Algorithm-4 bound multiset on the upper side is ``[u_tight, u_loose]`` (distinct),
-set ``a1``'s row's ``c`` to ``u_loose``; if Q_H stays FIT, ``a1`` accepts ``u_loose``
-so ``a1``'s upper bound is ``u_loose`` and ``a2``'s is ``u_tight`` (and vice versa).
-Lower bounds symmetrically.  ``k >= 3`` is left to the verifier-guided search in the
-assembler.
+1. discriminate ``d`` -- give the ``k`` rows of the alias-aware D_min ``k`` distinct
+   ascending values -- so the chain forces alias ``a_i`` onto the i-th-smallest-``d``
+   row;
+2. for every other column ``c`` that Algorithm 4 found a per-alias bound on, recover
+   alias ``a_i``'s bound on ``c`` directly: vary *just that one pinned row's* ``c``
+   and binary-search the FIT/UNFIT boundary.  Every other alias keeps binding its
+   own row (forced by the chain on ``d``), whose ``c`` is already inside its interval
+   (Q_H is FIT on the D_min), so Q_H stays FIT iff the varied value lies in alias
+   ``a_i``'s interval -- the boundary is exactly ``a_i``'s bound.
 
-Like the other multi-instance stages this probes inside a transaction that is rolled
-back; it is purely additive and gated behind ``[feature] multi_instance``.  Output:
-``pinned_filters[tab] = {alias_index -> {col -> {'lower': l_or_None, 'upper': u_or_None}}}``.
+This works for any ``k >= 2`` (the v1 used a single confirming probe and handled
+only ``k = 2``; the direct binary search is both simpler and complete).  When no
+chain pins all ``k`` aliases the attribution is left to the verifier-guided search
+in the assembler.
+
+Still not done here (would need the legacy SPJGAOL extractors' join graph to be
+alias-aware -- see docs/multi_instance.md §6): attributing the *legacy join* edge
+``R.fk = S.x`` to a specific alias of ``R`` when ``fk`` is not alias-coupled (when
+it is, the assembler's coupled-column chain ``R_a1.fk = R_a2.fk = ...`` already
+carries the join to every alias, so it is exact there).
+
+Like the other multi-instance stages this probes inside a transaction that is
+rolled back; it is purely additive and gated behind ``[feature] multi_instance``.
+Output: ``pinned_filters[tab] = {alias_index -> {col -> {'lower': l_or_None,
+'upper': u_or_None}}}`` (alias_index is 1-based, in the chain's ascending order).
 """
 from .abstract.AppExtractorBase import AppExtractorBase
 from .alias_aware_assembler import _topo_order_slots
 from .cross_alias_predicate import spread_values, _is_numeric
+from .per_alias_filter import find_step_breakpoints, domain_endpoint, _orderable
+
+
+# Probe calls allowed per side per (alias, column).  Must comfortably exceed
+# log2(domain span) -- ~31 for the ±2**31 int/numeric endpoints -- so an int bound
+# is pinned exactly and a numeric one to ~milli precision (find_step_breakpoints
+# falls back to the coarse bracket if it still runs out, so this is a quality knob,
+# not a correctness one).
+_BISECT_BUDGET = 40
+
+
+def recover_bound_via_fit_probe(fit_probe, start_val, dtype, direction, budget=_BISECT_BUDGET):
+    """Binary-search one side of an alias's filter interval on a column.
+
+    ``fit_probe(v) -> bool``: True iff Q_H stays FIT when *this* alias's pinned row
+    has the column set to ``v`` (every other alias keeps binding its own row, already
+    inside its interval).  ``start_val`` is a value strictly inside the interval (the
+    D_min value -- Q_H is FIT there).  ``direction`` > 0 searches the upper bound, < 0
+    the lower.  Returns the bound, or ``None`` if the interval is unbounded on that
+    side (Q_H still FIT at the type's domain endpoint) or the boundary could not be
+    bracketed.  Pure -- testable with a mock ``fit_probe``.
+    """
+    far_v = domain_endpoint(dtype, direction)
+    if (direction > 0 and not far_v > start_val) or (direction < 0 and not far_v < start_val):
+        return None
+    try:
+        if fit_probe(far_v):
+            return None                               # unbounded on this side
+    except Exception:
+        return None
+    probe = lambda v: 1 if fit_probe(v) else 0
+    if direction > 0:
+        bps = find_step_breakpoints(probe, start_val, far_v, 1, 0, dtype, [budget])
+        return bps[0][0] if bps else None             # last value still FIT == the upper bound
+    bps = find_step_breakpoints(probe, far_v, start_val, 0, 1, dtype, [budget])
+    return bps[0][1] if bps else None                 # first value FIT (going up) == the lower bound
 
 
 class PerAliasPinnedFilter(AppExtractorBase):
     """Attributes Algorithm 4's per-alias bound multiset to specific aliases when an
-    inter-alias chain pins them (k = 2 in v1)."""
+    inter-alias chain pins them (any ``k >= 2``)."""
 
     def __init__(self, connectionHelper, core_relations, mult,
                  alias_aware_min_instance_dict, cross_alias_predicates, per_alias_filters):
@@ -54,27 +102,28 @@ class PerAliasPinnedFilter(AppExtractorBase):
         except Exception as e:
             self.logger.debug(f"pre-probe commit: {e}")
         for tab in self.core_relations:
-            if int(self.mult.get(tab, 1)) != 2:
-                continue                               # v1: k == 2 only
+            k = int(self.mult.get(tab, 1))
+            if k < 2:
+                continue
             paf = self.per_alias_filters.get(tab) or {}
             if not paf:
                 continue
-            d, _topo = self._full_chain_column(tab, k=2)
+            d, chain = self._full_chain_column(tab, k)
             if d is None:
-                self.notes[tab] = "no inter-alias chain pins the aliases -- attribution skipped"
+                self.notes[tab] = f"no inter-alias chain pins all {k} aliases -- attribution skipped"
                 continue
             try:
-                attributed = self._attribute(query, tab, d, paf)
+                attributed = self._attribute(query, tab, d, k, paf)
             except Exception as e:
                 self.logger.error(f"PerAliasPinnedFilter failed on {tab}: {e}")
                 self._rollback()
                 attributed = {}
             if attributed:
                 self.pinned_filters[tab] = attributed
-                self.notes[tab] = "ok"
+                self.notes[tab] = f"ok (chain on {d} pins {k} aliases)"
                 self.logger.info(f"pinned per-alias filters [{tab}]: {attributed}")
             else:
-                self.notes[tab] = "no column had distinct per-alias bounds to attribute"
+                self.notes[tab] = "no per-alias bound could be attributed to a specific alias"
         return self.pinned_filters
 
     # ----------------------------------------------------------- transactions --
@@ -137,12 +186,12 @@ class PerAliasPinnedFilter(AppExtractorBase):
         return None, None
 
     # --------------------------------------------------------- the probe ---
-    def _attribute(self, query, tab, d, paf):
+    def _attribute(self, query, tab, d, k, paf):
         aa = self.alias_aware_min_instance_dict.get(tab)
-        if not aa or len(aa) - 1 < 2:
+        if not aa or len(aa) - 1 < k:
             return {}
         header = list(aa[0])
-        rows = [list(r) for r in aa[1:3]]
+        rows = [list(r) for r in aa[1:1 + k]]
         types = self._column_types(tab)
         if d not in header:
             return {}
@@ -150,53 +199,52 @@ class PerAliasPinnedFilter(AppExtractorBase):
 
         self._begin()
         try:
-            # discriminate d so the chain pins a1 = smaller-d row, a2 = larger-d row
-            cur_d = [rows[r][di] for r in range(2)]
-            spread = spread_values(cur_d, 2, types.get(d, ""))
-            target_d = list(spread) if spread is not None else sorted(cur_d, key=str)
-            for r in range(2):
+            # discriminate d so the chain pins alias i (1-based) -> i-th-smallest-d row
+            cur_d = [rows[r][di] for r in range(k)]
+            spread = spread_values(cur_d, k, types.get(d, ""))
+            if spread is None:
+                if len(set(str(x) for x in cur_d)) != k:
+                    return {}                          # can't make the chain column distinct
+                target_d = sorted(cur_d, key=str)
+            else:
+                target_d = list(spread)
+            for r in range(k):
                 rows[r][di] = target_d[r]
-            # order rows by d so rows[0] has the smaller d (= alias 1)
-            rows.sort(key=lambda rr: (rr[di] if not isinstance(rr[di], str) else str(rr[di])))
+            # order rows by d ascending: rows[i] is now alias (i+1)'s pinned row
+            rows.sort(key=lambda rr: (str(rr[di]) if isinstance(rr[di], str) else rr[di]))
             self._materialize(tab, header, rows, types)
             if not self._fit(query):
-                return {}                              # the chain isn't being pinned cleanly
+                return {}                              # the chain isn't being cleanly pinned
 
-            out = {1: {}, 2: {}}
+            out = {}
             for c, info in paf.items():
                 if c == d or c not in header:
                     continue
                 ci = header.index(c)
-                up_ms = list(info.get('upper_multiset') or sorted(info.get('upper') or [], key=str))
-                lo_ms = list(info.get('lower_multiset')
-                             or sorted(info.get('lower') or [], key=str, reverse=True))
-                up1 = self._attr_one_side(query, tab, header, rows, ci, types, up_ms, lower=False)
-                lo1 = self._attr_one_side(query, tab, header, rows, ci, types, lo_ms, lower=True)
-                if up1 is None and lo1 is None:
+                dt = types.get(c, "")
+                if not _orderable(dt):
                     continue
-                out[1][c] = {'upper': (up1[0] if up1 else None), 'lower': (lo1[0] if lo1 else None)}
-                out[2][c] = {'upper': (up1[1] if up1 else None), 'lower': (lo1[1] if lo1 else None)}
-            return {ai: cols for ai, cols in out.items() if cols}
+                for ai in range(k):                    # ai -> alias index ai + 1
+                    orig = rows[ai][ci]
+                    if orig is None:
+                        continue
+
+                    def fit_probe(v, _ai=ai, _ci=ci):
+                        rows[_ai][_ci] = v
+                        self._materialize(tab, header, rows, types)
+                        return self._fit(query)
+
+                    try:
+                        if not fit_probe(orig):        # D_min value should be inside the interval
+                            continue
+                        up = recover_bound_via_fit_probe(fit_probe, orig, dt, +1)
+                        lo = recover_bound_via_fit_probe(fit_probe, orig, dt, -1)
+                    finally:
+                        rows[ai][ci] = orig
+                        self._materialize(tab, header, rows, types)
+                    if up is None and lo is None:
+                        continue
+                    out.setdefault(ai + 1, {})[c] = {'lower': lo, 'upper': up}
+            return out
         finally:
             self._rollback()
-
-    def _attr_one_side(self, query, tab, header, rows, ci, types, multiset, lower):
-        """Returns ``(bound_for_a1, bound_for_a2)`` from a 2-element distinct multiset,
-        or ``None`` if there is nothing to attribute (uniform / empty)."""
-        if len(multiset) < 2:
-            return None
-        # multiset is tightest-first; for the upper side: [u_tight, u_loose] (ascending);
-        # for the lower side: [l_tight, l_loose] (descending, i.e. l_tight = max).
-        tight, loose = multiset[0], multiset[-1]
-        if str(tight) == str(loose):
-            return None
-        # set a1's row's column ci to the *loose* bound; if Q_H stays FIT, a1 accepts it.
-        orig = rows[0][ci]
-        rows[0][ci] = loose
-        try:
-            self._materialize(tab, header, rows, types)
-            a1_takes_loose = self._fit(query)
-        finally:
-            rows[0][ci] = orig
-            self._materialize(tab, header, rows, types)
-        return (loose, tight) if a1_takes_loose else (tight, loose)

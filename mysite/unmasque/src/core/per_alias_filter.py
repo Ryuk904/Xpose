@@ -120,11 +120,14 @@ def find_step_breakpoints(probe, a, b, av, bv, dtype, budget):
     each entry is an adjacent pair where the cardinality changes -- ``low_v`` is the
     last value with cardinality ``from_card`` (i.e. the *upper* bound of whatever
     interval was open to the left) and ``high_v`` is the first with ``to_card``
-    (the *lower* bound of the interval open to the right).
+    (the *lower* bound of the interval open to the right).  If the call budget is
+    exhausted while a step is still bracketed (but not yet pinned to adjacency) the
+    coarse bracket ``[a, b]`` is returned rather than dropping the step entirely --
+    a slightly imprecise bound is better than a missed one.
     """
-    if av == bv or budget[0] <= 0:
+    if av == bv:
         return []
-    if _adjacent(a, b, dtype):
+    if _adjacent(a, b, dtype) or budget[0] <= 0:
         return [(a, b, av, bv)]
     m = _midpoint(a, b, dtype)
     if m == a or m == b:
@@ -133,6 +136,21 @@ def find_step_breakpoints(probe, a, b, av, bv, dtype, budget):
     mv = probe(m)
     return (find_step_breakpoints(probe, a, m, av, mv, dtype, budget)
             + find_step_breakpoints(probe, m, b, mv, bv, dtype, budget))
+
+
+def domain_endpoint(dtype, direction):
+    """Far probe endpoint for the given side -- the column type's practical domain
+    limit, so a probe never pushes a value out of range.  ``direction`` > 0 -> the
+    high end, < 0 -> the low end.  (Module-level so the per-(alias,attribute) probe
+    in :mod:`per_alias_pinned_filter` can reuse it.)"""
+    d = str(dtype).lower()
+    if _is_date(dtype):
+        return _DATE_HI if direction > 0 else _DATE_LO
+    if "smallint" in d or "int2" in d:
+        return 32767 if direction > 0 else -32768
+    if _is_int(dtype):
+        return max_int_val if direction > 0 else min_int_val
+    return max_numeric_val if direction > 0 else min_numeric_val
 
 
 class PerAliasFilter(AppExtractorBase):
@@ -152,12 +170,13 @@ class PerAliasFilter(AppExtractorBase):
     _BISECT_BUDGET = 30          # probe calls allowed per side per column
 
     def __init__(self, connectionHelper, core_relations, mult,
-                 global_min_instance_dict, cross_alias_predicates=None):
+                 global_min_instance_dict, cross_alias_predicates=None, coupled_columns=None):
         super().__init__(connectionHelper, "PerAliasFilter")
         self.core_relations = list(dict.fromkeys(core_relations))
         self.mult = dict(mult or {})
         self.global_min_instance_dict = global_min_instance_dict or {}
         self.cross_alias_predicates = cross_alias_predicates or {}
+        self.coupled_columns = coupled_columns or {}
         self.per_alias_filters = {}
         self.notes = {}
 
@@ -243,7 +262,7 @@ class PerAliasFilter(AppExtractorBase):
                    f"insert into {self._fq(tab)} ({cols}) values ({va}), ({vb});")
 
     def _coupled_cols(self, tab):
-        out = set()
+        out = set(self.coupled_columns.get(tab, []))     # Algorithm-3 coupled columns (equi-join keys etc.)
         for p in self.cross_alias_predicates.get(tab, []):
             if p.get('kind') == 'inter':
                 out.add(p.get('col'))
@@ -251,18 +270,7 @@ class PerAliasFilter(AppExtractorBase):
                 out.update(p.get('cols', ()))
         return out
 
-    @staticmethod
-    def _domain_endpoint(dtype, direction):
-        """Far probe endpoint for the given side -- the column type's practical
-        domain limit, so we never push a value out of range."""
-        d = str(dtype).lower()
-        if _is_date(dtype):
-            return _DATE_HI if direction > 0 else _DATE_LO
-        if "smallint" in d or "int2" in d:
-            return 32767 if direction > 0 else -32768
-        if _is_int(dtype):
-            return max_int_val if direction > 0 else min_int_val
-        return max_numeric_val if direction > 0 else min_numeric_val
+    _domain_endpoint = staticmethod(domain_endpoint)
 
     # ----------------------------------------------------- the cardinality probe
     def _analyse_one(self, query, tab, k):

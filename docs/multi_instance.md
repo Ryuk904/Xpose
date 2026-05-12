@@ -1,9 +1,14 @@
 # Detecting Multi-Instance (Self-Join) Tables — Algorithm 1
 
-> Status: a first version is implemented — see `mysite/unmasque/src/core/multiplicity.py`,
-> wired (opt-in) into `mysite/unmasque/src/pipeline/fragments/DisjunctionPipeLine.py`.
-> Pure-logic unit tests are in `mysite/unmasque/test/MultiplicityTest.py`; the end-to-end
-> probing still needs a run against a live PostgreSQL + TPC-H setup with self-join queries.
+> Status: implemented and opt-in (`[feature] multi_instance`); see `mysite/unmasque/src/core/`
+> (`multiplicity / alias_aware_minimizer / cross_alias_predicate / per_alias_filter /
+> per_alias_pinned_filter / alias_aware_assembler.py`), wired into
+> `mysite/unmasque/src/pipeline/fragments/DisjunctionPipeLine.py` +
+> `mysite/unmasque/src/pipeline/ExtractionPipeLine.py`.  Pure-logic unit tests in
+> `mysite/unmasque/test/{Multiplicity,AliasAwareMinimizer,CrossAliasPredicate,PerAliasFilter,
+> PerAliasPinnedFilter,AliasAwareAssembler}Test.py`; end-to-end integration tests in
+> `mysite/unmasque/test/MultiInstancePipelineTest.py` (validated against TPC-H SF=0.1 — see
+> `docs/multi_instance_HANDOFF.md` for what works, the bugs that run surfaced, and what's left).
 > Audience: anyone working on the UNMASQUE / XPOSE extraction pipeline.
 
 ---
@@ -256,17 +261,26 @@ which — because, with the aliases free w.r.t. that column, the assignment is o
 irrelevant. When an **inter-alias chain on some column `d`** pins the aliases (`t_{a1}.d <
 t_{a2}.d < …`), the assignment *is* identifiable: discriminate `d` (k distinct ascending values
 across the alias-aware D_min's rows), so the chain forces alias `a_i` onto the i-th-smallest-`d`
-row; then a *targeted mutation of that row* reveals `a_i`'s bound on every other column. v1
-(`k = 2`): for a column `c` whose Algorithm-4 upper-bound multiset is `[u_tight, u_loose]`
-(distinct), set `a1`'s row's `c` to `u_loose`; if `Q_H` stays FIT then `a1`'s upper bound is
-`u_loose` (and `a2`'s is `u_tight`), else vice versa; lower bounds symmetrically.
+row; then, for every other column `c`, recover `a_i`'s bound on `c` **directly** by varying just
+that one pinned row's `c` and binary-searching the FIT/UNFIT boundary (`recover_bound_via_fit_probe`
+— a `find_step_breakpoints` on the 0/1 FIT signal): every other alias keeps binding its own row,
+whose `c` is inside its interval (`Q_H` is FIT on the D_min), so `Q_H` stays FIT iff the varied
+value is in `a_i`'s interval, and the boundary *is* `a_i`'s bound. This works for any `k ≥ 2`
+(the original v1 used a single confirming probe and only handled `k = 2`; the direct binary
+search is both simpler and complete). When no full chain pins all `k` aliases, attribution is
+left to the verifier-guided search above.
 
-Output `pinned_filters[tab] = {alias_index → {col → {'lower':l,'upper':u}}}`. The assembler
-uses it as the first candidate variant: it strips the rebound legacy filter atoms on `col` and
-emits the probed bounds with the correct alias identity (so the legacy `R_a1.col ≤ v_tight` —
-which is too tight if the probe says `a1` owns the loose bound — is replaced). `k ≥ 3` and the
-no-chain case are left to the verifier-guided search above. Runs in a rolled-back transaction,
-purely additive, behind `[feature] multi_instance`.
+Output `pinned_filters[tab] = {alias_index → {col → {'lower':l,'upper':u}}}` (1-based alias
+index, in the chain's ascending order; only aliases with a finite bound on `col` appear). The
+assembler uses it as the first candidate variant: it strips the rebound legacy filter atoms on
+`col` and emits the probed bounds with the correct alias identity (so the legacy `R_a1.col ≤
+v_tight` — too tight if the probe says `a1` owns the loose bound — is replaced). Runs in a
+rolled-back transaction, purely additive, behind `[feature] multi_instance`. Pure helper
+`recover_bound_via_fit_probe` is unit-tested (`test/PerAliasPinnedFilterTest.py`). **Not yet
+done:** attributing the *legacy join* edge `R.fk = S.x` to a specific alias of `R` when `fk` is
+not alias-coupled (when it is, the assembler's coupled-column chain `R_a1.fk = R_a2.fk = …`
+already carries the join to every alias — exact there); needs the legacy join graph to be
+alias-aware (§6).
 
 ---
 
@@ -292,8 +306,13 @@ Algorithm 2 short-circuits, reusing it directly instead of re-deriving from a po
 alias-aware) Filter / equi-join / AOA / generation extractors keep seeing a single witness row
 exactly as in the legacy pipeline — the only difference for them is *which* row, and they update
 all rows uniformly anyway, so they still recover the tightest/legacy predicates while Algorithm 4
-recovers the per-alias ones. With `multi_instance` off, `min_rows` is empty ⇒ floor 1 ⇒ legacy
-behaviour, plus the (always-safe) no-crash fix.
+recovers the per-alias ones. **Exception:** a *strict* self-join (`t1.x < t2.x`) has no single
+row on which `Q_H` is FIT, so the 1-row collapse would break `Q_H`; the re-collapse detects this
+(it re-runs `Q_H` after collapsing) and instead keeps the `k`-row witness set, so the legacy
+extractors at least start from a FIT instance — they still won't fully handle a strict self-join
+(that needs the alias-aware extractors, §6), but the multi-instance artifacts are all recovered.
+With `multi_instance` off, `min_rows` is empty ⇒ floor 1 ⇒ legacy behaviour, plus the
+(always-safe) no-crash fix.
 
 ---
 
@@ -401,8 +420,13 @@ Implemented:
   `self.per_alias_filters`, `self.per_alias_pinned_filters`, `self.alias_aware_query`,
   `self.alias_aware_query_verified` threaded onto the pipeline.
 * `[feature] multi_instance` flag (`configParser.py`, `constants.py`, the `config*.ini`).
-* `test/{Multiplicity,AliasAwareMinimizer,CrossAliasPredicate,PerAliasFilter,AliasAwareAssembler}Test.py`
+* `test/{Multiplicity,AliasAwareMinimizer,CrossAliasPredicate,PerAliasFilter,PerAliasPinnedFilter,AliasAwareAssembler}Test.py`
   — pure-logic tests (no DB).
+* `test/EQC_SJ_workload.sql` + `test/MultiInstancePipelineTest.py` — the EQC+SJ benchmark
+  queries (TPC-H Q2/Q17/Q21-flavoured self-join rewrites + synthetic `Sx-*` queries, each
+  annotated with what the pipeline should recover) and the live-DB integration-test scaffold
+  (skips if no TPC-H PostgreSQL is reachable). Validated against TPC-H SF=0.1 (5 pass, the
+  heavy 3-way one skipped); see `docs/multi_instance_HANDOFF.md` for the remaining issues.
 
 Not yet done (the rest of the EQC+SJ framework):
 
@@ -411,13 +435,18 @@ Not yet done (the rest of the EQC+SJ framework):
   `k` rows and they recover per-alias predicates directly, rather than the current arrangement
   where the minimization phase keeps `k` rows, hands the full set to Algorithms 2–4, and then
   *re-collapses to one row* so those extractors keep working unchanged (§2g). This is the
-  remaining structural piece; the rest of §F (and §E.3) presupposes it.
-* Extend the §F probe past `k = 2`, and probe the *legacy join* attribution (which alias of `R`
-  the `R.fk = S.x` edge belongs to) — currently `R_a1`, exact when `fk` is alias-coupled.
+  remaining structural piece; the rest of §F (and §E.3) presupposes it. **Detailed plan:**
+  `docs/multi_instance_extractors_plan.md`.
+* Probe the *legacy join* attribution (which alias of `R` the `R.fk = S.x` edge belongs to) —
+  currently `R_a1`, exact when `fk` is alias-coupled (the coupled-column chain carries it to
+  every alias then); the non-coupled case needs the legacy join graph to be alias-aware (above).
+  *(The §F probe itself now handles any `k ≥ 2`, not just `k = 2` — done.)*
 * Algorithm 3 extensions — cross-*column* cross-alias predicates (`t_p.a < t_q.b`), and
   cross-alias predicates on non-projected columns (lift Xpose's s-value-bound floating to
   alias pairs).
 * Algorithm 4 — **per-alias HAVING** (`HAVING l ≤ AGGR(t_i.x) ≤ u`); composes with
   Xpose/Alaap's aggregate-predicate "diagram" machinery rather than the cardinality probe.
-* An EQC+SJ benchmark suite (TPC-H Q2/Q17/Q21 rewrites + the synthetic `Sx-*` queries) and
-  an integration test that actually runs the probes against a live DB.
+* Validate the benchmark suite end-to-end against a live TPC-H PostgreSQL (the dev env had no
+  DB; the integration test's assertions are written against the *intended* behaviour and may
+  need tuning on first real run — especially the bisected per-alias bound values and which
+  alias the §F probe pins).

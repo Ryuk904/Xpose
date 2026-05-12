@@ -73,6 +73,13 @@ DEFAULT_MAX_MULT = 4
 # Name of the throw-away copy of a table we use while probing it.
 _BKP = "m_bkp"
 
+# Cap on the witness snapshot we inflate.  The cardinality fingerprint only needs
+# a snapshot that *exhibits* the self-join (some rows that join across aliases) --
+# not the whole (possibly sampled) table.  Kept small so even the ``kmax``-way
+# self-join of ``kmax+2`` inflated copies stays bounded -- and so the fresh-tuple
+# fallback, which *fetches* the result rows, doesn't blow up the client.
+_SNAPSHOT_CAP = 500
+
 # Relative tolerance when deciding two cardinalities are "the same".
 _EPS = 1e-9
 
@@ -167,51 +174,70 @@ class MultiplicityDetect(AppExtractorBase):
             self.logger.error(f"rollback failed: {e}")
 
     def _q_card(self, query):
-        """Cardinality of Q_H's result on the current DB state (bag semantics)."""
-        res = self.app.doJob(query)
+        """Cardinality of Q_H's result on the current DB state (bag semantics).
+
+        Wrapped in ``SELECT count(*) FROM (...)`` so the server aggregates it -- an
+        inflated self-join can produce millions of rows, and fetching them all into
+        the client (as ``self.app.doJob`` would) blows up memory."""
+        q = query.strip().rstrip(";").strip()
+        res = self.app.doJob(f"SELECT count(*) AS _n FROM ({q}) _sub;")
         if not isinstance(res, list) or len(res) <= 1:
             return 0          # UNFIT / empty / errored result; row 0 is the header
-        return len(res) - 1
+        try:
+            return int(res[1][0])
+        except (ValueError, TypeError, IndexError):
+            return 0
 
     def _snapshot_into_temp(self, tab):
         self.connectionHelper.execute_sql(
             [f"drop table if exists pg_temp.{_BKP};",
-             f"create temp table {_BKP} on commit drop as select * from {self._fq(tab)};"],
+             f"create temp table {_BKP} on commit drop as "
+             f"select * from {self._fq(tab)} limit {int(_SNAPSHOT_CAP)};"],
             self.logger)
 
     def _inflate_from_temp(self, tab, n):
-        """Replace T's content by ``n`` copies of the snapshot taken earlier."""
+        """Replace T's content by ``n`` copies of the snapshot taken earlier.
+
+        Done by ``DROP TABLE`` + ``CREATE TABLE AS`` rather than ``TRUNCATE`` +
+        ``INSERT``: this stage runs *before* the view minimizer, so T may still
+        carry its primary key / unique indexes (the minimizer strips them later via
+        ``CREATE TABLE AS``), and ``n`` copies of every row would violate them.
+        ``CREATE TABLE AS`` makes a plain table with no constraints/indexes, and the
+        whole thing is inside the rolled-back probe transaction so the original T
+        (PK and all) comes back on rollback."""
+        fq = self._fq(tab)
         self.connectionHelper.execute_sql(
-            [f"truncate table {self._fq(tab)};",
-             f"insert into {self._fq(tab)} "
-             f"select b.* from {_BKP} b, generate_series(1, {int(n)}) g;"],
+            [f"drop table if exists {fq} cascade;",
+             f"create table {fq} as select b.* from {_BKP} b, generate_series(1, {int(n)}) g;"],
             self.logger)
 
     # --- the per-table decision -------------------------------------------
     def _detect_one(self, query, tab):
-        base_card = self._q_card(query)
-        if base_card == 0:
+        if self._q_card(query) == 0:
             # Q_H is not FIT on the current DB for this table -- cannot probe.
             self.ambiguous.add(tab)
             return 1, "trivial"
 
         self._begin()
         try:
-            self._snapshot_into_temp(tab)
+            self._snapshot_into_temp(tab)               # bounded witness snapshot
 
-            # f(n) = |Q_H| when T holds n copies of its witness content.
-            # f(1) is base_card.  Sample up to n = kmax + 2 so the (kmax+1)-th
-            # finite difference is available.
-            cards = [base_card]
-            for n in range(2, self.max_mult + 3):
+            # f(n) = |Q_H| when T holds n copies of the (capped) witness snapshot.
+            # Sample n = 1 .. kmax + 2 so the (kmax+1)-th finite difference is
+            # available; f(1) is taken on the *sample* too (not the full table) so
+            # the series is internally consistent.
+            cards = []
+            for n in range(1, self.max_mult + 3):
                 self._inflate_from_temp(tab, n)
                 cards.append(self._q_card(query))
             self.cardinalities[tab] = list(cards)
             self.logger.debug(f"{tab}: cardinality probes (n=1..) {cards}")
 
-            if any(c == 0 for c in cards):
-                # A probe collapsed the result: a strict inequality / LIMIT /
-                # aggregate broke under duplication.  Fall back to slot counting.
+            base_card = cards[0]
+            if base_card == 0 or any(c == 0 for c in cards):
+                # The capped sample is not FIT, or a probe collapsed the result (a
+                # strict inequality / LIMIT / aggregate broke under duplication).
+                # Fall back to slot counting.
                 return self._fresh_tuple_probe(query, tab), "fresh-tuple"
 
             if all(_almost_equal(c, base_card) for c in cards):
@@ -219,17 +245,15 @@ class MultiplicityDetect(AppExtractorBase):
                 k_fresh = self._fresh_tuple_probe(query, tab)
                 return (k_fresh, "fresh-tuple") if k_fresh > 1 else (1, "scaling")
 
-            strictly_increasing = all(cards[i] < cards[i + 1] for i in range(len(cards) - 1))
-            if not strictly_increasing:
-                # Non-monotone: a LIMIT / partial DISTINCT / aggregate caps the
-                # row count, so the polynomial fit is unreliable.  Slot-count.
+            if not all(cards[i] < cards[i + 1] for i in range(len(cards) - 1)):
+                # Non-monotone: a LIMIT / partial DISTINCT / aggregate caps the row
+                # count, so the polynomial fit is unreliable.  Slot-count.
                 k_fresh = self._fresh_tuple_probe(query, tab)
                 return (k_fresh, "fresh-tuple") if k_fresh > 1 else (1, "scaling")
 
-            k = _finite_difference_degree(cards, self.max_mult)
-            return max(1, k), "scaling"
+            return max(1, _finite_difference_degree(cards, self.max_mult)), "scaling"
         finally:
-            self._rollback()  # undoes the temp table, truncate and inserts
+            self._rollback()  # undoes the temp table and the recreated table
 
     # --- Algorithm 1b: FreshTupleProbe (section B.3) -----------------------
     def _fresh_tuple_probe(self, query, tab):

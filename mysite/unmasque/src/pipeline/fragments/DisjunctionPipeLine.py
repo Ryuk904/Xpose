@@ -144,25 +144,38 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         # global_min_instance_dict keeps the full k-row witness set (Algorithms 2-4 use
         # it), but the *live* table (and its D_min copy) are re-collapsed to the first row
         # so the (not yet alias-aware) Filter / equi-join / AOA / generation extractors keep
-        # seeing a single witness row, exactly as in the legacy pipeline.
-        if getattr(self.connectionHelper.config, "detect_multi_instance", False) \
-                and any(int(k) > 1 for k in self.mult.values()):
+        # seeing a single witness row, exactly as in the legacy pipeline -- UNLESS that
+        # 1-row collapse makes Q_H UNFIT (a strict self-join `t1.x < t2.x` has no single
+        # FIT row), in which case the k-row witness set is kept so the legacy extractors at
+        # least start from a FIT instance (they still won't fully handle a strict self-join;
+        # that needs the alias-aware extractors -- see docs/multi_instance.md §6).
+        mi_tables = [t for t, k in self.mult.items() if int(k) > 1
+                     and self.global_min_instance_dict.get(t)
+                     and len(self.global_min_instance_dict[t]) > 2]
+        if getattr(self.connectionHelper.config, "detect_multi_instance", False) and mi_tables:
             try:
                 self.connectionHelper.execute_sql(
                     [f"set search_path='{self.connectionHelper.config.schema}';"])
                 q = self.connectionHelper.queries
-                for tab, k in self.mult.items():
-                    cur = self.global_min_instance_dict.get(tab)
-                    if int(k) <= 1 or not cur or len(cur) <= 2:
-                        continue
-                    fq = f"{self.connectionHelper.config.schema}.{tab}"
-                    attribs = "(" + ", ".join(str(c) for c in cur[0]) + ")"
-                    self.connectionHelper.execute_sql([q.truncate_table(fq)])
+
+                def _rebuild(_tab, _rows):
+                    _fq = f"{self.connectionHelper.config.schema}.{_tab}"
+                    _attribs = "(" + ", ".join(str(c) for c in self.global_min_instance_dict[_tab][0]) + ")"
+                    self.connectionHelper.execute_sql([q.truncate_table(_fq)])
                     self.connectionHelper.execute_sql_with_params(
-                        q.insert_into_tab_attribs_format(attribs, "", fq), [tuple(cur[1])])
+                        q.insert_into_tab_attribs_format(_attribs, "", _fq), [tuple(r) for r in _rows])
                     self.connectionHelper.execute_sql(
-                        [q.drop_table_cascade(q.get_dmin_tabname(tab)),
-                         q.create_table_as_select_star_from(q.get_dmin_tabname(tab), tab)])
+                        [q.drop_table_cascade(q.get_dmin_tabname(_tab)),
+                         q.create_table_as_select_star_from(q.get_dmin_tabname(_tab), _tab)])
+
+                for tab in mi_tables:                         # try collapsing each to its 1st witness row
+                    _rebuild(tab, [self.global_min_instance_dict[tab][1]])
+                res = vm.app.doJob(query)
+                if not (isinstance(res, list) and len(res) > 1):
+                    for tab in mi_tables:                     # 1-row collapse broke Q_H -> restore k rows
+                        _rebuild(tab, self.global_min_instance_dict[tab][1:])
+                    self.logger.info("re-collapse to 1 row makes Q_H UNFIT (strict self-join); kept the "
+                                     "k-row witness set -- legacy SPJGAOL extraction will be partial.")
             except Exception as e:
                 self.logger.error("could not re-collapse multi-instance tables to a single row.", str(e))
 
@@ -236,7 +249,8 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
             if any(v > 1 for v in self.mult.values()):
                 try:
                     paf = PerAliasFilter(self.connectionHelper, core_relations, self.mult,
-                                         self.global_min_instance_dict, self.cross_alias_predicates)
+                                         self.global_min_instance_dict, self.cross_alias_predicates,
+                                         self.cross_alias_coupled_columns)
                     paf.doJob(query)
                     self.per_alias_filters = dict(paf.per_alias_filters)
                     self.info['PER_ALIAS_FILTERS'] = {'filters': dict(paf.per_alias_filters),

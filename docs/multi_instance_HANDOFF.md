@@ -4,6 +4,152 @@ This is a continuation doc. The full design rationale is in **`docs/multi_instan
 first — it has §-by-§ explanations of every algorithm). This file is the "what's done, what's
 left, what to watch out for" summary.
 
+## Update — session 3 (2026-05-12)
+
+### Environment note (the DB-less caveat is OUTDATED)
+
+A live PostgreSQL 18 + TPC-H (SF=0.1) **is in fact available** in this dev env — it was just
+not in the system paths: `postgres` is running on `:5432` (socket `/tmp/.s.PGSQL.5432`), the
+`tpch` database has the 8 TPC-H tables loaded (lineitem ≈ 600k rows), and the **`unmasque`
+conda env** (`/home/swan/miniforge3/envs/unmasque/bin/python`) has all the deps (pandas,
+psycopg2, sympy, tabulate, oracledb, `postgresql` client tools). So: run things with
+`/home/swan/miniforge3/envs/unmasque/bin/python`, connect with `PGPASSWORD=postgres psql -h
+localhost -U postgres -d tpch`. The integration tests below were run against it.
+
+### What changed this session
+
+1. **§F probe → any `k ≥ 2`** (`src/core/per_alias_pinned_filter.py`, rewritten). v1 used a
+   single confirming probe and only handled `k = 2`; now: discriminate the chain column `d`,
+   then for every other column `c` *binary-search each alias's bound directly* by varying that
+   alias's pinned row's `c` (the other aliases keep binding their own, already-FIT rows). New
+   pure helper `recover_bound_via_fit_probe` (a `find_step_breakpoints` on the 0/1 FIT signal),
+   unit-tested in `test/PerAliasPinnedFilterTest.py`. Output shape unchanged
+   (`pinned_filters[tab] = {alias_index → {col → {'lower','upper'}}}`), so the assembler is
+   untouched. The probe now runs for `mult ≥ 2` (was `== 2`); still skipped when no full chain
+   pins all `k` aliases.
+2. **`find_step_breakpoints` budget-exhaustion fix** (`src/core/per_alias_filter.py`): it used
+   to return `[]` when the call budget ran out mid-bisection with a step still bracketed —
+   *dropping the bound entirely*. Now it returns the coarse bracket `[a, b]` (a slightly
+   imprecise bound beats a missed one). Also factored `_domain_endpoint` out to a module-level
+   `domain_endpoint` so the §F probe can reuse it. `_BISECT_BUDGET` is 40 in the §F probe
+   (≥ log2 of the ±2³¹ domain so int bounds come out exact); `PerAliasFilter._BISECT_BUDGET`
+   left at 30 (the new graceful-degradation makes that a quality knob, not a correctness one).
+3. **Conditional re-collapse** (`DisjunctionPipeLine._mutation_pipeline`): the 1-row re-collapse
+   would make `Q_H` UNFIT for a *strict* self-join (`t1.x < t2.x` — no single FIT row), which
+   would then break the legacy Filter stage immediately. Now: collapse all multi-instance tables
+   to row 0, re-run `Q_H`, and if it came back UNFIT, restore the full `k`-row witness set
+   instead (so the legacy extractors at least *start* FIT — they still won't fully handle a
+   strict self-join; that's the alias-aware-extractors piece). For non-strict self-joins
+   behaviour is unchanged (still collapses to 1 row).
+4. **EQC+SJ benchmark + integration scaffold**: `test/EQC_SJ_workload.sql` (categorised
+   self-join Q_H queries — A: equi-join + non-strict ineq, B: + strict ineq, C: per-alias
+   filters, D: projection alias-lift, E: 3-way, F: mixed multiplicity, G: boundary cases — each
+   annotated with the expected `mult` / cross-alias preds / per-alias filters / alias-aware
+   query) and `test/MultiInstancePipelineTest.py` (drives the real pipeline with
+   `multi_instance = yes` on a subset; skips cleanly if no TPC-H PostgreSQL is reachable;
+   assertions written against the *intended* behaviour — likely need tuning on first real run).
+5. **`docs/multi_instance_extractors_plan.md`**: detailed implementation plan for the big
+   remaining piece (making the legacy SPJGAOL extractors natively alias-aware). Suggested first
+   PR there: `Filter` → per-alias.
+
+### Bugs the live-DB run surfaced and fixed (the DB-touching code had never executed before)
+
+6. **`MultiplicityDetect._inflate_from_temp` violated the PK/unique index.** It ran *before* the
+   view minimizer, when the tables still carry their indexes (the minimizer strips them via
+   `CREATE TABLE AS`), so `n` copies of every row → unique violation → MultiplicityDetect failed
+   on *every* TPC-H table and left the working schema broken. Fixed: it now does `DROP TABLE` +
+   `CREATE TABLE AS SELECT b.* FROM m_bkp b, generate_series(1, n) g` (no constraints/indexes),
+   inside the rolled-back probe transaction so the original table comes back on rollback.
+7. **`MultiplicityDetect` OOM'd on inflated self-join results.** `_q_card` fetched all rows
+   (`self.app.doJob` → `cur.fetchall()`); an inflated `k`-way self-join is millions of rows →
+   OOM-killed. Fixed: `_q_card` now runs `SELECT count(*) FROM (<query>) _sub` (server-side
+   aggregate). Also: the inflation snapshot is capped (`_SNAPSHOT_CAP = 500` rows -- the
+   fingerprint only needs a snapshot that *exhibits* the self-join), and `f(1) .. f(kmax+2)` are
+   now all measured on that capped sample (the old `f(1) = base_card` was on the full table —
+   inconsistent series).
+8. **`CrossAliasPredicate` didn't recognise the equi-join key as "coupled".** Discriminating
+   `t.k` (giving the `k` rows distinct `k` values) leaves the `t_i = t_i` self-pairs in `Q_H`'s
+   result, so `_fit` stayed True and the key was wrongly treated as freely discriminable → the
+   assembler emitted a *cartesian product*. Fixed: `_analyse_one` now tracks `|Q_H|` -- a
+   self-join's D_min normally has cross-row pairs (`|Q_H| > k`); discriminating the join key
+   collapses `|Q_H|` to `~k`, which is the signal that column is essential to the join → coupled.
+   (Falls back to the FIT-only check when the D_min is already degenerate, `|Q_H| <= k`.)
+9. **`infer_inter_alias_predicates` couldn't read non-strict (`<=` / `>=`) inter-alias preds.**
+   The `t_i = t_i` self-pairs that a non-strict `<=` keeps add an `'='` to an otherwise
+   strictly-`<` relation set; the code only mapped `{'<'}`/`{'>'}`/`{'='}`. Fixed: `{'<','='}` →
+   `<=`, `{'>','='}` → `>=`. (Strict `<` self-joins drop the self-pairs entirely, so they were
+   already fine.)
+10. **`PerAliasFilter` probed the equi-join key.** It only skipped columns appearing in
+    `cross_alias_predicates` (inter/intra preds), not those in `coupled_columns`, so it produced
+    a bogus `t.k = <D_min value>` "filter". Fixed: `PerAliasFilter` now also takes
+    `coupled_columns` and skips those.
+
+### Test results (run with the `unmasque` conda env's python against the live TPC-H SF=0.1)
+
+- **All 92 pure-logic tests pass** (`Multiplicity / CrossAliasPredicate / PerAliasFilter /
+  PerAliasPinnedFilter / AliasAwareAssembler / AliasAwareMinimizerTest.py`).
+- **`MultiInstancePipelineTest.py`: 5 pass, 1 skipped (`Ran 6 tests, OK (skipped=1)`).**
+  - `test_A1` (partsupp, equi-join + non-strict `<=`): `mult=2`, `ps_partkey` coupled, assembled
+    `… Where partsupp_a1.ps_partkey = partsupp_a2.ps_partkey` ✓ (the non-projected `ps_supplycost
+    <=` ordering is *not* recovered — Algorithm 3 v1 only does same-column inter-alias preds on
+    *projected* columns).
+  - `test_C3` (`ps1.ps_supplycost <= 700 AND ps2.ps_supplycost <= 700`): assembled
+    `… Where partsupp_a1.ps_supplycost <= 700 and partsupp_a1.ps_partkey = partsupp_a2.ps_partkey
+    and partsupp_a2.ps_supplycost <= 699` ✓✓ (essentially exact, ~1 unit of bisection slop).
+  - `test_C1` (`<= 500 AND <= 800`): both per-alias bounds recovered (~500, ~715 — the ~715
+    should be ~800; numeric bisection precision over the ±2³¹ domain with a 30-step budget).
+    *Missing* the `ps_partkey = ps_partkey` chain — for *this* run the floored minimizer landed
+    on 2 rows of *different* partkeys (a degenerate "FIT only via self-pairs" witness), so the
+    coupled-key detection didn't fire. (See "remaining issues" below.)
+  - `test_B2` (partsupp, STRICT `<` on a projected column): `mult=2`, `ps_partkey` coupled,
+    inter-alias `<` on `ps_supplycost` recovered, projection attribution `{0:(partsupp,1,ps_supplycost),
+    1:(partsupp,2,ps_supplycost)}` ✓✓ — but the legacy `eq` is `None` (a strict self-join breaks
+    the legacy Filter — it mutates columns uniformly across the k-row D_min), so no assembled query.
+  - `test_G1` (idempotent self-join on the full PK): no crash, legacy `eq` produced (boundary
+    case — `mult` reported as ≥1, the output isn't "ideal", which is by design).
+  - `test_E1` (3-way self-join, **skipped**): heavy on the un-sampled DB (the view minimizer +
+    the assembler's verification fetch large result sets). Needs Cs2 sampling wired up
+    (`key_lists`) or a smaller DB. Runs manually.
+
+### Remaining issues (next steps, roughly priority-ordered)
+
+A. **Strict self-joins break the legacy SPJGAOL extractors** → `eq = None` → no assembled query
+   (`test_B2` / category B / D1 in the workload). Root cause: the legacy `Filter`/`equi_join`/
+   `aoa` mutate columns *uniformly across all rows*, so on a `k`-row strict-self-join D_min any
+   uniform value fails `t1.x < t2.x` → garbage / abort. **This is the alias-aware-extractors
+   piece** (`docs/multi_instance_extractors_plan.md`) — now well-motivated by concrete observation.
+   A cheaper interim fix: have the assembler synthesise a base query from the multi-instance
+   artifacts when `eq is None` (`SELECT <attributed cols> FROM <core_rels> WHERE <coupled chains>
+   AND <inter-alias preds> AND <per-alias filters>`) instead of needing the legacy `eq` string.
+B. **Degenerate alias-aware D_min** (`test_C1`): for a self-join `t1.k = t2.k AND <filters>`,
+   the floored minimizer can land on `k` rows with *distinct* `k` values (Q_H is "FIT" only via
+   the `t_i = t_i` self-pairs). Then CrossAliasPredicate can't detect `k` as coupled (its
+   cardinality-drop check needs `|Q_H| > k` on the D_min). Fix: `AliasAwareMinimizer` should
+   prefer a D_min whose rows exercise the *cross-alias* join (e.g. require `|Q_H| > k` when
+   trimming), or CrossAliasPredicate should fall back to a per-column "perturb the join key and
+   see if Q_H survives" probe for the degenerate case.
+C. **Non-projected cross-alias ordering predicates** (`test_A1`): `t1.x REL t2.x` is only
+   recovered when `x` is projected from ≥2 aliases. Lift Xpose's `aoa.py` s-value-bound floating
+   to alias pairs (handoff §5.4 / docs §6).
+D. **Numeric bisection precision** (`test_C1`'s ~715): `find_step_breakpoints` over the ±2³¹
+   numeric domain with `PerAliasFilter._BISECT_BUDGET = 30` runs out before pinning a `numeric`
+   bound (and before finding a 2nd step). Bump the budget, or coarse-scan outward (×10 steps)
+   then bisect inside the bracket.
+E. **`PerAliasFilter` "spike at `A.c`" artifact**: when Q_H has a cross-alias inequality, the
+   2-row `{A, B(V)}` probe sees an extra pair at `V == A.c` (B becomes identical to A), so a
+   spurious 1-element bound multiset `[A.c]` appears for that column. Harmless today (the
+   assembler ignores 1-element tails), but it would shift a real multiset in a query that has
+   *both* a cross-alias inequality and a real per-alias filter on the same column.
+
+Note: `.gitignore` has `*.sql`, so `test/EQC_SJ_workload.sql` won't be picked up by a plain
+`git add` — use `git add -f mysite/unmasque/test/EQC_SJ_workload.sql` when committing (the
+existing `U2_workload.sql` and the other tracked `.sql` files were force-added the same way).
+
+Everything below this section is the original session-2 handoff (still accurate except where
+the above supersedes it: §1 "no live database" is wrong — see the environment note above; §2
+"per_alias_pinned_filter.py" is now k≥2; §3 pipeline order is unchanged but the re-collapse is
+now conditional; §5 items 2 (partial) and 6 (partial) are done).
+
 ## 0. Where things are
 
 - **Repo:** the work is entirely inside the `Xpose` submodule at `/home/swan/Desktop/unmasque/Xpose/`

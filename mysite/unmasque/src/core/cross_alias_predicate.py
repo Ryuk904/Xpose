@@ -142,12 +142,12 @@ def infer_inter_alias_predicates(out_rows, disc_windows):
                 for r in data:
                     ip, iq = _window_index(r[sp], windows), _window_index(r[sq], windows)
                     rel.add('=' if ip == iq else ('<' if ip < iq else '>'))
-                if rel == {'='}:
-                    preds.append((col, sp, sq, '='))
-                elif rel == {'<'}:
-                    preds.append((col, sp, sq, '<'))
-                elif rel == {'>'}:
-                    preds.append((col, sp, sq, '>'))
+                # the t_i = t_i self-pairs (which a non-strict `<=`/`>=` keeps) add an '='
+                # to an otherwise-strictly-ordered relation set -- read those as `<=`/`>=`.
+                op = {frozenset({'='}): '=', frozenset({'<'}): '<', frozenset({'>'}): '>',
+                      frozenset({'<', '='}): '<=', frozenset({'>', '='}): '>='}.get(frozenset(rel))
+                if op:
+                    preds.append((col, sp, sq, op))
     return preds
 
 
@@ -259,6 +259,10 @@ class CrossAliasPredicate(AppExtractorBase):
     def _fit(self, query):
         res = self._q(query)
         return bool(res) and self.app.isQ_result_nonEmpty_nullfree(res)
+
+    def _card(self, query):
+        res = self._q(query)
+        return (len(res) - 1) if isinstance(res, list) and len(res) >= 1 else 0
 
     def _column_types(self, tab):
         try:
@@ -374,8 +378,16 @@ class CrossAliasPredicate(AppExtractorBase):
             # --- materialise the alias-aware D_min ---
             cur_rows = [list(r) for r in rows]
             self._materialize(tab, header, cur_rows, types)
-            if not self._fit(query):
+            base_card = self._card(query)
+            if base_card < 1:
                 return preds, [], "alias-aware D_min not FIT after re-materialise"
+            # A self-join's D_min normally exhibits cross-row pairs (|Q_H| > k -- not
+            # just the k trivial t_i = t_i self-pairs); if it does, discriminating the
+            # equi-join key collapses |Q_H| down to ~k, which is how we tell that column
+            # is *coupled* (essential to the join) rather than freely discriminable.
+            # If the D_min is already degenerate (|Q_H| <= k) we can't make that call,
+            # so we fall back to the FIT-only check.
+            track_card = base_card > k
 
             # --- discriminate column-groups, one at a time ---
             disc_windows = {}
@@ -403,7 +415,9 @@ class CrossAliasPredicate(AppExtractorBase):
                     for g in group:
                         trial_rows[j][header.index(g)] = target[j]
                 self._materialize(tab, header, trial_rows, types)
-                if self._fit(query):
+                trial_card = self._card(query)
+                ok = trial_card >= 1 and (trial_card > k if track_card else True)
+                if ok:
                     cur_rows = trial_rows
                     for g in group:
                         stored = self._read_col_sorted(tab, g)

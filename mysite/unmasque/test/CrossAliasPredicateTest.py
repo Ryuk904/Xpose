@@ -65,6 +65,15 @@ class MyTestCase(unittest.TestCase):
         out = [('t1_x', 't2_x'), (10, 10), (10, 20), (20, 10), (20, 20)]
         self.assertEqual(infer_inter_alias_predicates(out, {'x': [10, 20]}), [])
 
+    def test_infer_le(self):
+        # t1.x <= t2.x : the t_i=t_i self-pairs add '=' to an otherwise strictly-< set
+        out = [('t1_x', 't2_x'), (10, 10), (20, 20), (10, 20)]
+        self.assertEqual(infer_inter_alias_predicates(out, {'x': [10, 20]}), [('x', 0, 1, '<=')])
+
+    def test_infer_ge(self):
+        out = [('t1_x', 't2_x'), (10, 10), (20, 20), (20, 10)]
+        self.assertEqual(infer_inter_alias_predicates(out, {'x': [10, 20]}), [('x', 0, 1, '>=')])
+
     def test_infer_three_way_chain(self):
         out = [('a', 'b', 'c'), (5, 15, 25)]
         self.assertEqual(infer_inter_alias_predicates(out, {'x': [5, 15, 25]}),
