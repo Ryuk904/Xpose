@@ -1164,27 +1164,43 @@ AND      o2.o1_orderdate BETWEEN date '1995-01-01' AND date '1995-12-31'
 GROUP BY RIGHT(c_address, 5),
          p_brand 
 ORDER BY city, part_brand;""", False, True, False, False),
-                     TestQuery("ETPCH_Q24", """select c_address as city 
-from customer, 
-orders o1, 
-order1 o2, 
-store_lineitem, 
-web_lineitem w, 
-part, 
-web_lineitem1 w1, 
-partsupp ps1, 
+                     TestQuery("ETPCH_Q24", """select c_address as city
+from customer,
+orders o1,
+order1 o2,
+store_lineitem,
+web_lineitem w,
+part,
+web_lineitem1 w1,
+partsupp ps1,
 partsupp1 ps2
-where c_custkey = o1.o_custkey and c_custkey = o2.o1_custkey 
+where c_custkey = o1.o_custkey and c_custkey = o2.o1_custkey
 and o1.o_orderkey = sl_orderkey and sl_returnflag = 'A'
 and o2.o1_orderkey = w.wl_orderkey and w.wl_returnflag = 'N'
 and w.wl_partkey = sl_partkey and sl_partkey = p_partkey and w1.wl1_partkey = p_partkey
-and sl_receiptdate < w.wl_receiptdate 
+and sl_receiptdate < w.wl_receiptdate
 and o1.o_orderdate < o2.o1_orderdate
 and w.wl_suppkey = ps1.ps_suppkey and w1.wl1_suppkey = ps2.ps1_suppkey
 and ps2.ps1_availqty >= ps1.ps_availqty
 and o1.o_orderdate between date '1995-01-01' and date '1995-12-31'
 and o2.o1_orderdate between date '1995-01-01' and date '1995-12-31'
 group by c_address;""", False, True, False, False),
+
+                     TestQuery("lineitem_disj", """SELECT l_orderkey, l_partkey FROM lineitem
+WHERE l_quantity BETWEEN 10 AND 20
+OR l_quantity BETWEEN 30 AND 40;""", True, False, False, False),
+
+                     TestQuery("SJ1", """SELECT l1.l_orderkey FROM lineitem l1, lineitem l2
+WHERE l1.l_orderkey = l2.l_orderkey AND l1.l_quantity < l2.l_quantity;""",
+                               False, False, False, False),
+
+                     TestQuery("SJ2", """SELECT l1.l_orderkey FROM lineitem l1, lineitem l2
+WHERE l1.l_orderkey = l2.l_orderkey;""",
+                               False, False, False, False),
+
+                     TestQuery("SJ3", """SELECT n1.n_name FROM nation n1, nation n2
+WHERE n1.n_regionkey = n2.n_nationkey;""",
+                               False, False, False, False),
 
                      ]
     return test_workload

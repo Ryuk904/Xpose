@@ -4,6 +4,7 @@ from abc import abstractmethod, ABC
 from ...core.abstract.MinimizerBase import Minimizer
 from ...util.constants import UNMASQUE
 from ....src.core.aoa import InequalityPredicate
+from ....src.core.cardinality_probe import CardinalityProbe
 from ....src.core.cs2 import Cs2
 from ....src.core.db_restorer import DbRestorer
 from ....src.core.equi_join import U2EquiJoin
@@ -13,6 +14,7 @@ from ....src.pipeline.abstract.generic_pipeline import GenericPipeLine
 from ....src.util.aoa_utils import get_constants_for
 from ....src.util.constants import FILTER, INEQUALITY, DONE, RUNNING, START, EQUALITY, DB_MINIMIZATION, \
     SAMPLING, RESTORE_DB, ERROR
+from ....src.util.instance import build_instances
 from ....src.util.utils import get_format, get_val_plus_delta
 from ....src.util.error_handling import UnmasqueError
 
@@ -31,6 +33,16 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         self.db_restorer = None
         self.global_min_instance_dict = None
         self.key_lists = None
+        # Phase 1: per-table minimum cardinality observed during view minimization.
+        # min_card[T] > 1 signals that T is referenced multiple times in Qh's FROM.
+        self.min_card = None
+        # Phase 2: alias-aware data model. instances is one entry per logical
+        # use of a base table in Qh; alias_to_table is the reverse map.
+        # For single-instance tables, alias == table (no behavioural change).
+        self.instances = None
+        self.alias_to_table = None
+        # Phase 3: per-alias witness row with ctid bookkeeping (from ViewMinimizer).
+        self.global_alias_row_dict = None
 
     def _mutation_pipeline(self, core_relations, query, time_profile, restore_details=None):
         self.update_state(RESTORE_DB + START)
@@ -90,12 +102,54 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         self.db_restorer.update_last_restored_size(vm.all_sizes)
         self.info[DB_MINIMIZATION] = vm.global_min_instance_dict
         self.global_min_instance_dict = copy.deepcopy(vm.global_min_instance_dict)
+        self.min_card = copy.deepcopy(vm.min_card)
+        multi_instance = {t: k for t, k in self.min_card.items() if k > 1}
+        if multi_instance:
+            self.logger.info(f"Multi-instance tables detected (min_card > 1): {multi_instance}")
+        # Phase 2: derive alias-aware handles. For single-instance tables this
+        # is a no-op (alias == table); for multi-instance tables it produces
+        # k synthetic aliases that downstream phases will key predicates by.
+        self.instances, self.alias_to_table = build_instances(core_relations, self.min_card)
+        # Phase 3: per-alias witness rows + ctids for ctid-scoped mutation.
+        self.global_alias_row_dict = copy.deepcopy(vm.global_alias_row_dict)
+        if self.global_alias_row_dict:
+            for _alias, _entry in self.global_alias_row_dict.items():
+                self.logger.info(
+                    f"alias_row_dict[{_alias}]: table={_entry['table']} ctid={_entry['ctid']} "
+                    f"row_preview={tuple(_entry['row'])[:5]}"
+                )
+
+        # Pre-Filter self-join detection. For each table at min_card=1 the
+        # probe checks whether duplicating the witness row causes |Qh| to
+        # scale as m^2 (self-join with 2 aliases) versus m (single-table).
+        # On promotion it rewires min_card / global_*_dicts / instances in
+        # place so the Filter constructor below sees the k=2 state, and
+        # emits constant-equality seed predicates for the discovered join
+        # keys (Filter would otherwise miss them — row-joined-to-itself
+        # self-satisfaction defeats the per-attribute boundary probes).
+        cardinality_probe = CardinalityProbe(
+            self.connectionHelper, core_relations,
+            self.global_min_instance_dict,
+            self.global_alias_row_dict,
+            self.instances,
+            self.alias_to_table,
+            self.min_card,
+        )
+        cardinality_probe.doJob(query)
+        if cardinality_probe.promoted_tables:
+            self.logger.info(
+                f"CardinalityProbe: promoted tables {cardinality_probe.promoted_tables}; "
+                f"seeded {len(cardinality_probe.seed_filter_predicates)} predicates"
+            )
 
         '''
         Constant Filter Extraction
         '''
         self.update_state(FILTER + START)
-        self.filter_extractor = Filter(self.connectionHelper, core_relations, self.global_min_instance_dict)
+        self.filter_extractor = Filter(self.connectionHelper, core_relations, self.global_min_instance_dict,
+                                       global_alias_row_dict=self.global_alias_row_dict,
+                                       instances=self.instances,
+                                       alias_to_table=self.alias_to_table)
         self.update_state(FILTER + RUNNING)
         check = self.filter_extractor.doJob(query)
         self.update_state(FILTER + DONE)
@@ -110,6 +164,25 @@ class DisjunctionPipeLine(GenericPipeLine, ABC):
         if not check:
             self.info[FILTER] = None
             self.logger.info("No filter found")
+        # Forward the per-table Qh-referenced column set so EquiJoin can pick
+        # a marker column when disambiguating swap-symmetric cross-alias edges
+        # on cross-column self-joins (e.g. SJ3's n_regionkey/n_nationkey).
+        self.filter_extractor.qh_cols_by_table = getattr(
+            cardinality_probe, 'qh_cols_by_table', {}) or {}
+
+        # Append the cardinality probe's seed predicates so EquiJoin sees a
+        # constant-equality group on each promoted join key and the existing
+        # Phase 5 self-equi-join detection can fire.
+        if cardinality_probe.seed_filter_predicates:
+            if self.filter_extractor.filter_predicates is None:
+                self.filter_extractor.filter_predicates = []
+            for pred in cardinality_probe.seed_filter_predicates:
+                if pred not in self.filter_extractor.filter_predicates:
+                    self.filter_extractor.filter_predicates.append(pred)
+            self.logger.info(
+                f"CardinalityProbe: filter_predicates after seeding: "
+                f"{self.filter_extractor.filter_predicates}"
+            )
         self.info[FILTER] = self.filter_extractor.filter_predicates
 
         '''

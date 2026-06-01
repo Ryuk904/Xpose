@@ -123,6 +123,24 @@ class CommonQueries(ABC):
     def update_sql_query_tab_date_attrib_value(self, tab, attrib, value):
         return self.update_tab_attrib_with_value(tab, attrib, value)
 
+    def update_tab_attrib_with_value_at_ctid(self, tab, attrib, value, ctid):
+        """Phase 3: ctid-scoped UPDATE for per-alias mutation. RETURNING the new
+        ctid is essential — Postgres MVCC moves the row to a fresh ctid on every
+        UPDATE, so the caller must refresh its stored ctid or the next UPDATE
+        silently affects zero rows."""
+        return f"UPDATE {tab} SET {attrib} = {value} WHERE ctid = '{ctid}' RETURNING ctid::text;"
+
+    def update_tab_attrib_with_quoted_value_at_ctid(self, tab, attrib, value, ctid):
+        return f"UPDATE {tab} SET {attrib} = '{value}' WHERE ctid = '{ctid}' RETURNING ctid::text;"
+
+    def update_tab_date_attrib_value_at_ctid(self, tab, attrib, value, ctid):
+        return self.update_tab_attrib_with_value_at_ctid(tab, attrib, value, ctid)
+
+    def select_ctid_star_from(self, tab):
+        # ORDER BY ctid so the i-th SELECT row maps to the i-th INSERT row,
+        # which is what alias↔ctid re-anchoring depends on after TRUNCATE+INSERT.
+        return f"SELECT ctid::text, * FROM {tab} ORDER BY ctid;"
+
     @abstractmethod
     def form_update_query_with_value(self, update_string, datatype, val):
         pass

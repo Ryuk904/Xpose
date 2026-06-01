@@ -36,7 +36,12 @@ select c_mktsegment as segment from customer, nation, orders, lineitem where c_a
   and (n_name = 'BRAZIL' or n_regionkey = 3);
 
 -- DQ9
-select n_name,SUM(s_acctbal) from supplier,partsupp,nation where ps_suppkey=s_suppkey and 
+select n_name,SUM(s_acctbal) from supplier,partsupp,nation where ps_suppkey=s_suppkey and
   s_nationkey=n_nationkey and (s_acctbal > 2000 or ps_supplycost < 500 or ps_supplycost >= 7000) group by n_name ORDER BY n_name LIMIT 10;
+
+-- SJ1: self-join with distinguishing inequality predicate. Exercises the
+-- Phase 1-7 multi-instance pipeline added for self-join extraction.
+SELECT l1.l_orderkey FROM lineitem l1, lineitem l2
+WHERE l1.l_orderkey = l2.l_orderkey AND l1.l_quantity < l2.l_quantity;
 
 

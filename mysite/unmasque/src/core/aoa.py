@@ -345,14 +345,23 @@ class InequalityPredicate(FilterHolder):
 
     def __what_is_concrete_bound_val(self, tab_attrib, is_UB):
         compare_op = '<=' if is_UB else '>='
+        # Gap-aware extraction may emit multiple ('range', lb, ub) tuples for the
+        # same (tab, attrib) to encode a disjunction of intervals. AOA reasoning
+        # treats the attribute as a single contiguous range; return the envelope
+        # bound (max(ub) for UB, min(lb) for LB) across all matching tuples so
+        # that downstream AOA logic gets the conservative outer bound.
+        bound_val = None
         for pred in self.arithmetic_filters:
             if (pred[0], pred[1]) == tab_attrib:
                 if pred[2] in ['equal', '=', compare_op, 'range']:
-                    if is_UB:
-                        return pred[4]
-                    else:
-                        return pred[3]
-        return None
+                    val = pred[4] if is_UB else pred[3]
+                    if bound_val is None:
+                        bound_val = val
+                    elif is_UB and val > bound_val:
+                        bound_val = val
+                    elif (not is_UB) and val < bound_val:
+                        bound_val = val
+        return bound_val
 
     def __what_is_possible_bound_val(self, E, L, col_src, datatype, is_UB):
         get_extreme = get_max if is_UB else get_min

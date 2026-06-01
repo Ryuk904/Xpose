@@ -76,9 +76,14 @@ class Minimizer(AppExtractorBase, ABC):
         if self.check_result_for_half(mid_ctid2, end_ctid, dirty_tab, tabname, query):
             # Take the lower half
             start_ctid = mid_ctid2
-        else:
+        elif self.check_result_for_half(start_ctid, mid_ctid1, dirty_tab, tabname, query):
             # Take the upper half
             end_ctid = mid_ctid1
+        else:
+            # Self-join floor: neither half preserves Pop, so the current size
+            # is the minimum cardinality this table needs to keep Qh non-empty.
+            self.logger.info("Cannot halve anymore..")
+            start_ctid, end_ctid = None, None
         return end_ctid, start_ctid
 
     def get_start_and_end_ctids(self, core_sizes, query, tabname, dirty_tab):

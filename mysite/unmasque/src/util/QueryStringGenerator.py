@@ -20,6 +20,16 @@ def append_clause(output, clause, param):
 class QueryDetails:
     def __init__(self):
         self.core_relations = []
+        # Phase 6: alias-aware FROM rendering. When `instances` is set, the FROM
+        # clause is emitted as `base alias` per instance; otherwise we fall back
+        # to bare `core_relations` (single-instance behaviour, unchanged).
+        self.instances = None
+        self.alias_to_table = None
+        # Phase 6+ : columns visible under each synthetic alias, used to
+        # qualify bare SELECT cols when multiple aliases of the same base
+        # table are in FROM (Postgres would otherwise flag the col as
+        # ambiguous). {alias_name -> tuple_of_col_names}.
+        self.cols_by_alias = None
 
         self.eq_join_predicates = []
         self.filter_in_predicates = []
@@ -29,6 +39,11 @@ class QueryDetails:
         self.all_aoa = []
         self.join_edges = []
         self.or_predicates = []
+        # (tab, attr) -> [(lb1, ub1), (lb2, ub2), ...] for gap-aware extraction.
+        # Set from Filter.disjunctive_ranges before render. When non-empty for
+        # a given (tab, attr), render emits an OR of BETWEEN clauses from this
+        # dict instead of the (envelope-collapsed) tuple in arithmetic_filters.
+        self.disjunctive_ranges = {}
 
         self.projection_names = []
         self.global_projected_attributes = []
@@ -140,6 +155,17 @@ class QueryStringGenerator:
             self._workingCopy.arithmetic_filters.append(value)
 
     @property
+    def disjunctive_ranges(self):
+        return self._workingCopy.disjunctive_ranges
+
+    @disjunctive_ranges.setter
+    def disjunctive_ranges(self, value):
+        if value:
+            self._workingCopy.disjunctive_ranges = dict(value)
+        else:
+            self._workingCopy.disjunctive_ranges = {}
+
+    @property
     def select_op(self):
         return self._workingCopy.select_op
 
@@ -179,6 +205,33 @@ class QueryStringGenerator:
     def from_clause(self, core_relations):
         self._workingCopy.core_relations = core_relations
         self._workingCopy.core_relations.sort()
+
+    @property
+    def instances(self):
+        return self._workingCopy.instances
+
+    @instances.setter
+    def instances(self, value):
+        # Phase 6: receive the alias-aware FROM model from the pipeline.
+        self._workingCopy.instances = list(value) if value else None
+
+    @property
+    def alias_to_table(self):
+        return self._workingCopy.alias_to_table
+
+    @alias_to_table.setter
+    def alias_to_table(self, value):
+        self._workingCopy.alias_to_table = dict(value) if value else None
+
+    @property
+    def cols_by_alias(self):
+        return self._workingCopy.cols_by_alias
+
+    @cols_by_alias.setter
+    def cols_by_alias(self, value):
+        # Pipeline derives this from global_alias_row_dict; render uses it
+        # to qualify SELECT cols belonging to multi-instance tables.
+        self._workingCopy.cols_by_alias = dict(value) if value else None
 
     @property
     def algebraic_predicates(self):
@@ -377,7 +430,18 @@ class QueryStringGenerator:
         return where_clause
 
     def formulate_query_string(self):
-        self._workingCopy.from_op = ", ".join(self._workingCopy.core_relations)
+        # Phase 6: emit `base alias` syntax when the pipeline supplied alias-
+        # aware instances. For single-instance tables alias == base so the
+        # rendered FROM is identical to today's `", ".join(core_relations)`.
+        instances = self._workingCopy.instances
+        if instances:
+            parts = []
+            for inst in instances:
+                table, alias = inst.table, inst.alias
+                parts.append(table if alias == table else f"{table} {alias}")
+            self._workingCopy.from_op = ", ".join(parts)
+        else:
+            self._workingCopy.from_op = ", ".join(self._workingCopy.core_relations)
         self._workingCopy.where_op = self.__generate_where_clause()
         self.generate_groupby_select()
         eq = self.write_query()
@@ -481,7 +545,33 @@ class QueryStringGenerator:
         apc_predicates = self._workingCopy.filter_in_predicates \
                          + self._workingCopy.arithmetic_filters \
                          + self._workingCopy.filter_not_in_predicates
+
+        # For (tab, attr) with a gap-aware disjunction recorded in
+        # disjunctive_ranges, swap the envelope range tuple in apc_predicates
+        # for an OR of BETWEEN clauses built from the per-interval list.
+        # Everything else renders the standard way.
+        disj_ranges = getattr(self._workingCopy, 'disjunctive_ranges', None) or {}
+        rendered_disjunctions = set()
+
         for a_eq in apc_predicates:
+            is_range_tuple = (isinstance(a_eq, (tuple, list)) and len(a_eq) >= 5
+                              and str(a_eq[2]).strip().lower() == 'range')
+            key = (a_eq[0], a_eq[1]) if is_range_tuple else None
+            if key is not None and key in disj_ranges and key not in rendered_disjunctions:
+                rendered_disjunctions.add(key)
+                parts = []
+                for (lb, ub) in disj_ranges[key]:
+                    sub_tuple = (a_eq[0], a_eq[1], 'range', lb, ub)
+                    p = self.formulate_predicate_from_filter(sub_tuple)
+                    if p:
+                        parts.append(p)
+                if not parts:
+                    continue
+                pred = parts[0] if len(parts) == 1 else '(' + ' OR '.join(parts) + ')'
+                add_item_to_list(pred, predicates)
+                continue
+            if key is not None and key in rendered_disjunctions:
+                continue  # skip the envelope tuple for an already-rendered disjunction
             pred = self.formulate_predicate_from_filter(a_eq)
             add_item_to_list(pred, predicates)
 
@@ -508,6 +598,13 @@ class QueryStringGenerator:
                 remove_item_from_list(attrib, self._workingCopy.global_groupby_attributes)
 
     def __generate_select_clause(self):
+        # When multi-instance aliases are in play (self-join), an unqualified
+        # SELECT col is ambiguous to Postgres because the same column exists
+        # in multiple FROM-aliases. Build attr→alias from any alias-tagged
+        # predicate already in this query (equi-join groups, filters) and use
+        # the first match to qualify bare SELECT cols.
+        alias_for_attr = self._build_alias_for_attr_map()
+
         for i in range(len(self._workingCopy.global_projected_attributes)):
             elt = self._workingCopy.global_projected_attributes[i]
             if self._workingCopy.global_aggregated_attributes[i][1] != '':
@@ -515,6 +612,11 @@ class QueryStringGenerator:
                     elt = self._workingCopy.global_aggregated_attributes[i][1]
                 else:
                     elt = self._workingCopy.global_aggregated_attributes[i][1] + '(' + elt + ')'
+            elif elt and elt in alias_for_attr:
+                # Bare attribute (no aggregate); qualify with an alias of one
+                # of the FROM-instances that has this attribute, so Postgres
+                # can resolve it unambiguously.
+                elt = f"{alias_for_attr[elt]}.{elt}"
 
             if elt != self._workingCopy.projection_names[i] and self._workingCopy.projection_names[i] != '':
                 if self._workingCopy.projection_names[i] == ORPHAN_COLUMN:
@@ -522,6 +624,42 @@ class QueryStringGenerator:
                 else:
                     elt = elt + ' as ' + self._workingCopy.projection_names[i]
             self._workingCopy.select_op = elt if not i else f'{self._workingCopy.select_op}, {elt}'
+
+    def _build_alias_for_attr_map(self) -> dict:
+        alias_for_attr: dict = {}
+        ata = self._workingCopy.alias_to_table or {}
+        if not any(a != t for a, t in ata.items()):
+            return alias_for_attr  # no synthetic aliases active
+
+        def consider(alias, attr):
+            if alias in ata and attr and attr not in alias_for_attr:
+                alias_for_attr[attr] = alias
+
+        # Primary source: alias dict's schema info — every column of every
+        # synthetic alias gets mapped to that alias (first one wins for
+        # cross-alias columns, which is fine because the cols are identical
+        # between aliases of the same base table).
+        cba = self._workingCopy.cols_by_alias or {}
+        for alias, cols in cba.items():
+            if alias not in ata or ata[alias] == alias:
+                continue  # not a synthetic alias
+            for col in cols:
+                consider(alias, col)
+
+        # Fallback / tightening: also pull from alias-tagged predicates so
+        # the first alias we map an attribute to matches the alias used in
+        # WHERE-clause references (cosmetic, but keeps emitted SQL tidy).
+        for grp in (self._workingCopy.eq_join_predicates or []):
+            for member in grp:
+                if isinstance(member, tuple) and len(member) == 2:
+                    consider(member[0], member[1])
+        for pred in (self._workingCopy.arithmetic_filters or []):
+            if len(pred) >= 2:
+                consider(pred[0], pred[1])
+        for pred in (self._workingCopy.filter_in_predicates or []):
+            if len(pred) >= 2:
+                consider(pred[0], pred[1])
+        return alias_for_attr
 
     def __generate_group_by_clause(self):
         self.__optimize_group_by_attributes()

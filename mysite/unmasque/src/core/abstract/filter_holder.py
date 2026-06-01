@@ -7,7 +7,24 @@ class FilterHolder(UN2WhereClause):
     def __init__(self, connectionHelper,
                  core_relations,
                  global_min_instance_dict, filter_extractor, name):
-        super().__init__(connectionHelper, core_relations, global_min_instance_dict, name)
+        # Phase 3/4: inherit the alias-aware state from the filter extractor so
+        # downstream holders (equi_join, aoa) see the same per-alias witnesses
+        # AND can resolve aliases back to base tables for SQL emission.
+        alias_dict = getattr(filter_extractor, "global_alias_row_dict", None)
+        instances = getattr(filter_extractor, "instances", None)
+        alias_to_table = getattr(filter_extractor, "alias_to_table", None)
+        super().__init__(connectionHelper, core_relations, global_min_instance_dict, name,
+                         global_alias_row_dict=alias_dict,
+                         instances=instances,
+                         alias_to_table=alias_to_table)
+        # MutationPipeLineBase deep-copied the alias dict; for FilterHolder we
+        # need to SHARE it by reference with the filter_extractor so probes
+        # routed through filter_extractor.extract_filter_on_attrib_set and
+        # mutations routed through inherited mutate_dmin_with_val both see the
+        # same (and only) live ctids. Without this, the two dicts diverge and
+        # one path issues stale ctids that match zero rows on Postgres MVCC.
+        if alias_dict is not None:
+            self.global_alias_row_dict = filter_extractor.global_alias_row_dict
         self.filter_extractor = filter_extractor
 
         # method from filter object

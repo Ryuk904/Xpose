@@ -55,12 +55,29 @@ class GenerationPipeLineBase(MutationPipeLineBase):
         return check
 
     def restore_d_min_from_dict(self) -> None:
+        # values = [attribs_tuple, row1, row2, ...]. On single-instance tables
+        # there is exactly one row, so the legacy per-attribute whole-table
+        # UPDATE is correct. On multi-instance tables (k > 1) the whole-table
+        # UPDATE would collapse every alias's row to row1's values, breaking
+        # self-joins where the two aliases must differ; TRUNCATE+INSERT
+        # restores the per-alias rows verbatim (Bug #6: SJ1 self-join).
         for tab in self.core_relations:
             values = self.global_min_instance_dict[tab]
-            attribs, vals = values[0], values[1]
-            for i in range(len(attribs)):
-                attrib, val = attribs[i], vals[i]
-                self.update_with_val(attrib, tab, val)
+            if len(values) > 2:
+                attribs = values[0]
+                attrib_list = ", ".join(attribs)
+                fqn = self.get_fully_qualified_table_name(tab)
+                self.connectionHelper.execute_sql(
+                    [self.connectionHelper.queries.truncate_table(fqn)])
+                self.connectionHelper.execute_sql_with_params(
+                    self.connectionHelper.queries.insert_into_tab_attribs_format(
+                        f"({attrib_list})", "", fqn),
+                    list(values[1:]))
+            else:
+                attribs, vals = values[0], values[1]
+                for i in range(len(attribs)):
+                    attrib, val = attribs[i], vals[i]
+                    self.update_with_val(attrib, tab, val)
 
     def do_init(self) -> None:
         for tab in self.core_relations:

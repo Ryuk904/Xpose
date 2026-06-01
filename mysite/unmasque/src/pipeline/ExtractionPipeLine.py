@@ -207,15 +207,51 @@ class ExtractionPipeLine(DisjunctionPipeLine,
 
         self.q_generator.get_datatype = self.filter_extractor.get_datatype  # method
         self.q_generator.from_clause = core_relations
+        # Phase 6: alias-aware FROM rendering. For single-instance tables this
+        # is a no-op (alias == base table); for multi-instance it emits the
+        # `T alias` syntax needed for self-joins.
+        self.q_generator.instances = self.instances
+        self.q_generator.alias_to_table = self.alias_to_table
+        # Per-alias column list (from the view minimizer / cardinality probe).
+        # Lets QSG qualify SELECT cols against synthetic aliases even when the
+        # column never appears in a WHERE-clause predicate (e.g. SJ3's n_name).
+        if self.global_alias_row_dict:
+            self.q_generator.cols_by_alias = {
+                alias: entry.get("cols", ())
+                for alias, entry in self.global_alias_row_dict.items()
+            }
         self.q_generator.algebraic_predicates = self.aoa
         self.q_generator.arithmetic_disjunctions = self.genPipelineCtx
 
         self.q_generator.pgaoCtx = self.pgao_ctx
         self.q_generator.limit = lm
+        # Side channel for gap-aware (within-attribute) disjunctions discovered
+        # by Filter._refine_with_gap_search. Must be set before formulate_*
+        # because the render path reads it to OR-group BETWEEN clauses.
+        self.q_generator.disjunctive_ranges = getattr(
+            self.filter_extractor, 'disjunctive_ranges', None)
         eq = self.q_generator.formulate_query_string()
         self.logger.debug("extracted query:\n", eq)
 
         eq = self._extract_NEP(core_relations, self.all_sizes, query, self.genPipelineCtx)
+
+        # Phase 7: verification probe. Compares Qh vs the extracted Q_E to
+        # catch multi-instance / self-join shapes that the floor signal missed
+        # (e.g. when an aggregation collapses the result-cardinality fingerprint).
+        # The probe borrows the filter_extractor's app executable since the
+        # pipeline doesn't carry its own.
+        try:
+            from ..core.multiplicity_probe import MultiplicityProbe
+            executor = getattr(self.filter_extractor, "app", None)
+            if executor is not None:
+                probe = MultiplicityProbe(self.connectionHelper, executor, logger=self.logger)
+                report = probe.run(query, eq, min_card=self.min_card, instances=self.instances)
+                if report.get("warnings"):
+                    for w in report["warnings"]:
+                        self.logger.info(f"MultiplicityProbe: {w}")
+                self.info["MULTIPLICITY_PROBE"] = report
+        except Exception as e:
+            self.logger.debug(f"MultiplicityProbe skipped: {e}")
         return eq
 
     def __gen_pipeline_preprocess(self, core_relations):
