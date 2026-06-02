@@ -3,6 +3,7 @@ import ast
 from frozenlist._frozenlist import FrozenList
 
 from .dataclass.genPipeline_context import GenPipelineContext
+from .row_probe import RowProbe
 from ..util.error_codes import ERROR_005
 from ..util.error_handling import UnmasqueError
 
@@ -24,6 +25,9 @@ class GroupBy(GenerationPipeLineBase):
         self.projected_attribs = pgao_ctx.projected_attribs
         self.has_groupby = False
         self.group_by_attrib = []
+        # Enabler S2: duplicate-row probe used to disambiguate a literal
+        # constant 1 from a COUNT()==1 (WI-05).
+        self._row_probe = RowProbe(self.connectionHelper, self.app, self.logger)
 
     def doExtractJob(self, query):
         # Array to check for 1 as constant or count in select clause. (will be used later)
@@ -93,12 +97,101 @@ class GroupBy(GenerationPipeLineBase):
 
         self.remove_duplicates()
 
-        # Putting the value 1 where 1 is there in the result wrt array.
-        for i in range(len(check_array)):
-            if check_array[i] == CONST_1_THERE:
-                self.projected_attribs[i] = CONST_1_VALUE
+        # const-1 vs COUNT()==1 disambiguation (WI-05).
+        #
+        # The value heuristic above marks a column CONST_1_THERE when every
+        # group it happened to observe showed the literal string '1'. That is
+        # *unsound*: a genuine COUNT(*) / COUNT(col) whose value is 1 in every
+        # probed group is indistinguishable, by value alone, from a literal 1.
+        # It is sound today only because the probe synthesises the grouping
+        # column with the repeated delta [0, 1, 1] (groupby_clause:39), which
+        # incidentally always materialises a >=2-row group for a real COUNT —
+        # an unrelated implementation detail the classifier should not lean on.
+        #
+        # Resolve each candidate directly with a controlled duplicate-row probe
+        # (enabler S2): on the single-group witness instance D¹, duplicate one
+        # contributing witness row. A COUNT tracks row multiplicity and rises
+        # 1 -> 2; the literal 1 is invariant and stays 1.
+        const1_cols = [i for i in range(len(check_array)) if check_array[i] == CONST_1_THERE]
+        for i in self._confirm_const1_columns(query, const1_cols):
+            self.projected_attribs[i] = CONST_1_VALUE
 
         return True
+
+    def _confirm_const1_columns(self, query, const1_cols):
+        """Confirm, via an S2 duplicate-row probe, which value-heuristic
+        const-1 candidates are genuinely the literal constant 1.
+
+        Returns the sublist of ``const1_cols`` that are real literal-1 columns.
+        Columns that turn out to be a COUNT stuck at 1 are dropped from the
+        returned list, so they are left empty-projected and Aggregation
+        renders them as ``COUNT(*)`` (groupby_clause feeds aggregation.py:241).
+
+        Soundness: the literal 1 does not depend on row multiplicity, whereas
+        COUNT increases by at least one when a contributing tuple is added.
+        Probing on ``D¹`` (a single group) makes the duplicated tuple land in
+        that one group, so the group's value — read as the max over the lone
+        result row — is a clean signal with no multi-group dilution. The probe
+        only runs when there is at least one candidate, and degrades to the
+        old heuristic verdict (treat as const-1) whenever it cannot get a
+        trustworthy reading, so it never introduces a false positive on a real
+        literal 1.
+        """
+        if not const1_cols:
+            return []
+        if not self.core_relations:
+            return list(const1_cols)
+
+        # Fresh single-witness instance: one group, Qh non-empty & null-free.
+        self.do_init()
+        base_res = self.app.doJob(query)
+        if not self.app.done:
+            return list(const1_cols)
+        base_rows = self.app.get_all_nullfree_rows(base_res)
+        if not base_rows:
+            return list(const1_cols)
+        base_val = {i: self._max_int_in_col(base_rows, i) for i in const1_cols}
+
+        # Add exactly one contributing tuple: duplicate a single witness row of
+        # the first core relation by ctid (targeted, so a k>1 alias table is
+        # not over-inserted), then revert it.
+        fqn = self.get_fully_qualified_table_name(self.core_relations[0])
+        ctids = self._row_probe.list_ctids(fqn)
+        new_ctids = self._row_probe.duplicate_rows(fqn, ctids[:1] if ctids else None)
+        try:
+            after_res = self.app.doJob(query)
+            after_rows = self.app.get_all_nullfree_rows(after_res) if self.app.done else []
+        finally:
+            if new_ctids:
+                self._row_probe.delete_rows(fqn, new_ctids)
+
+        genuine = []
+        for i in const1_cols:
+            b = base_val.get(i)
+            a = self._max_int_in_col(after_rows, i) if after_rows else None
+            if a is not None and b is not None and a > b:
+                self.logger.info(f"GroupBy: column {i} reclassified const-1 -> COUNT "
+                                 f"(duplicate-row probe {b} -> {a})")
+            else:
+                genuine.append(i)
+        return genuine
+
+    @staticmethod
+    def _max_int_in_col(rows, col_index):
+        """Largest integer value in result column ``col_index`` across
+        ``rows`` (string-valued result tuples); ``None`` if no row carries an
+        integer there."""
+        best = None
+        for row in rows:
+            if col_index >= len(row):
+                continue
+            try:
+                v = int(str(row[col_index]).strip())
+            except (ValueError, TypeError):
+                continue
+            if best is None or v > best:
+                best = v
+        return best
 
     def insert_values_for_single_attrib(self, attrib_inner, datatype, insert_values, tabname_inner):
         if datatype in NON_TEXT_TYPES:

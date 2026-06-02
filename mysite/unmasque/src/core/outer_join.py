@@ -251,24 +251,54 @@ class OuterJoin(GenerationPipeLineBase):
         self.sem_eq_queries = sem_eq_queries
 
     def __are_the_results_same(self, poss_q, query, same):
-        # result of hidden query
-        res_HQ = self.app.doJob(query)
-        # result of extracted query
-        res_poss_q = self.app.doJob(poss_q)
-        #  maybe needs  work
-        if len(res_HQ) != len(res_poss_q):
-            same = False
-        else:
-            data_HQ = res_HQ[1:]
-            data_poss_q = res_poss_q[1:]
-            # maybe use the available result comparator techniques
-            for var in range(len(data_HQ)):
-                self.logger.debug(data_HQ[var] == data_poss_q[var])
-                if not (data_HQ[var] == data_poss_q[var]):
-                    self.logger.debug(data_HQ[var])
-                    self.logger.debug(data_poss_q[var])
-                    same = False
-        return same
+        # Equivalence oracle for an outer-join candidate (Q_E = poss_q) against the
+        # hidden query (Qh = query), evaluated on the *current mutated* D1.
+        #
+        # Before: an ordered, positional Python row-by-row equality after a length
+        # check ("maybe use the available result comparator techniques"). That is
+        # fragile -- SQL results are bags, so row reordering (e.g. ORDER BY ties)
+        # or duplicate rows could make two genuinely equivalent results compare
+        # unequal (or two different results compare equal under a coincidental
+        # alignment). Replace it with the proven Re/Rh diff primitive
+        # (cf. Comparator.run_diff_queries / is_match): the two results are
+        # bag-equal iff (Qh EXCEPT ALL Q_E) and (Q_E EXCEPT ALL Qh) are BOTH empty.
+        # We run the diff in-stage via app.doJob so it observes the mutation the
+        # caller just applied -- Comparator.match would first restore the DB to
+        # user_schema and erase that mutation.
+        if not same:
+            return False  # an earlier mutation already separated them; stays separated
+        fwd = self.__bag_diff_count(query, poss_q)   # |Qh EXCEPT ALL Q_E|
+        rev = self.__bag_diff_count(poss_q, query)   # |Q_E EXCEPT ALL Qh|
+        self.logger.debug(f"EXCEPT ALL diff counts: fwd={fwd}, rev={rev}")
+        if fwd is None or rev is None:
+            # Could not certify equivalence -> reject the candidate. This is the
+            # sound direction: never accept an outer-join variant we cannot verify.
+            return False
+        return fwd == 0 and rev == 0
+
+    def __bag_diff_count(self, left_q, right_q):
+        # count(*) of (left_q EXCEPT ALL right_q), evaluated on the mutated D1 via
+        # app.doJob (so the caller's current mutation is in effect). Returns None
+        # if the diff could not be evaluated (treated as "not verifiable").
+        left = (left_q or "").rstrip().rstrip(';').strip()
+        right = (right_q or "").rstrip().rstrip(';').strip()
+        if not left or not right:
+            return None
+        # Parenthesised leaves so each side keeps its own ORDER BY / LIMIT
+        # (Postgres applies a bare trailing ORDER BY/LIMIT to the whole set-op).
+        diff_sql = f"select count(*) from (({left}) except all ({right})) as T;"
+        try:
+            res = self.app.doJob(diff_sql)
+        except Exception as e:
+            self.logger.debug(f"EXCEPT ALL diff failed: {e}")
+            return None
+        # res == [ (colname,), (count_str,) ]; a degenerate result -> failure.
+        if not res or len(res) < 2 or not res[1]:
+            return None
+        try:
+            return int(str(res[1][0]).strip())
+        except (ValueError, TypeError):
+            return None
 
     def __add_tabname_for_attrib(self, attrib, list_of_tables, temp):
         tabname = self.find_tabname_for_given_attrib(attrib)
@@ -291,6 +321,23 @@ class OuterJoin(GenerationPipeLineBase):
         aoa_on, aoa_where = self.__determine_on_and_where_aoa(query)
         set_possible_queries = []
         for seq in final_edge_seq:
+            # WI-11 routing decision. Build a JOIN...ON candidate ONLY when this
+            # edge-sequence carries a genuine outer (non-symmetric) marker. An
+            # all-('l','l') sequence is a pure inner join, which the comma-FROM
+            # baseline (self.Q_E, already rendered in doExtractJob) represents
+            # verbatim -- so we do NOT also emit a JOIN...ON form for it. This is
+            # the guard that keeps the two FROM emitters mutually exclusive:
+            #   * inner route  -> we 'continue' and never touch q_gen, so the
+            #     comma-FROM baseline stands untouched;
+            #   * outer route  -> we clear_from_where_ops() (wiping the comma-FROM
+            #     'from_op' to '') BEFORE generate_from_on_clause builds JOIN...ON,
+            #     so the candidate's FROM is purely the JOIN...ON form.
+            # Decided directly on the importance_dict markers, NOT by string-
+            # matching 'OUTER' in the rendered SQL as before (cf. WI-01: prefer a
+            # principled marker over a substring scan of the output).
+            if not self._seq_routes_to_join_on(seq):
+                self.logger.debug("seq is pure inner-join; keeping comma-FROM baseline")
+                continue
             self.q_gen.backup_query_before_new_generation()
             self.q_gen.clear_from_where_ops()
             for edge in seq:
@@ -301,13 +348,30 @@ class OuterJoin(GenerationPipeLineBase):
             self.q_gen.generate_groupby_select()
             q_candidate = self.q_gen.write_query()
             self.logger.debug("+++++++++++++++++++++")
-            if q_candidate.count('OUTER'):
-                set_possible_queries.append(q_candidate)
+            set_possible_queries.append(q_candidate)
 
         for q in set_possible_queries:
             self.logger.debug(q)
 
         return set_possible_queries, fp_on
+
+    def _seq_routes_to_join_on(self, seq):
+        # WI-11 routing predicate: True iff this edge-sequence contains at least
+        # one non-symmetric (outer) join marker -- (l,h)/(h,l)/(h,h) -- in which
+        # case the FROM must be rendered as JOIN...ON via generate_from_on_clause.
+        # An all-('l','l') sequence is a pure inner join and keeps the comma-FROM
+        # baseline (result-equivalent, structurally simpler, output unchanged).
+        # The dangerous error is a false *outer* (emitting LEFT/RIGHT/FULL where
+        # Qh is INNER, which drops/keeps dangling rows wrongly); marking an edge
+        # outer requires a genuine non-symmetric marker here AND survival of the
+        # WI-03 EXCEPT-ALL equivalence check downstream, so this predicate can only
+        # *propose* an outer candidate, never finalize one.
+        for edge in seq:
+            table1, table2 = edge[0][1], edge[1][1]
+            imp_t1, imp_t2 = self.__determine_join_edge_type(edge, table1, table2)
+            if (imp_t1, imp_t2) != ('l', 'l'):
+                return True
+        return False
 
     def __determine_on_and_where_aoa(self, query):
         aoa_pred_on, aoa_pred_where = [], []
@@ -371,6 +435,12 @@ class OuterJoin(GenerationPipeLineBase):
 
     def __determine_join_edge_type(self, edge, table1, table2):
         # steps to determine type of join for edge
+        # WI-11: default to ('l','l') -- the sound (INNER -> comma-FROM) direction
+        # -- when the edge is absent from importance_dict, instead of leaving the
+        # markers unbound. The old code fell through the else with imp_t1/imp_t2
+        # never assigned, raising UnboundLocalError; harmless while the stage was
+        # opt-in, but a hard crash now that outer-join routing is the default path.
+        imp_t1, imp_t2 = 'l', 'l'
         if tuple(edge) in self.importance_dict.keys():
             imp_t1 = self.importance_dict[tuple(edge)][table1]
             imp_t2 = self.importance_dict[tuple(edge)][table2]
@@ -378,6 +448,6 @@ class OuterJoin(GenerationPipeLineBase):
             imp_t1 = self.importance_dict[tuple(list(reversed(edge)))][table1]
             imp_t2 = self.importance_dict[tuple(list(reversed(edge)))][table2]
         else:
-            self.logger.debug("error sneha!!!")
+            self.logger.debug("edge not found in importance_dict; defaulting to INNER ('l','l')")
         self.logger.debug(imp_t1, imp_t2)
         return imp_t1, imp_t2
