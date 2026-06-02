@@ -28,6 +28,13 @@ MIN = 'Min'
 MAX = 'Max'
 COUNT = 'Count'
 COUNT_STAR = 'Count(*)'
+# WI-06: internal op sentinel for COUNT(DISTINCT col). Stored on the aggregate
+# tuple as (col, COUNT_DISTINCT); rendered specially by QSG as
+# 'Count(distinct <col>)'. It deliberately contains the 'Count' substring so the
+# order-by stage's `COUNT in op` substring checks treat it like a count (correct);
+# it is never emitted verbatim (QSG has a dedicated render branch before the
+# generic `op + '(' + col + ')'` path).
+COUNT_DISTINCT = 'Count(distinct)'
 NO_ORDER = 'noorder'
 
 # To differentiate between count and constants in SELECT clause.
@@ -66,6 +73,7 @@ USE_CS2 = "cs2"
 DETECT_OR = "or"
 DETECT_OJ = "outer_join"
 DETECT_GAP_AWARE = "gap_aware"
+DETECT_COUNT_DISTINCT = "count_distinct"
 
 
 WAITING = "_WAITING"

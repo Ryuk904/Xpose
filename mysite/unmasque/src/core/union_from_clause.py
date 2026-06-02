@@ -58,16 +58,32 @@ class UnionFromClause(Schema, AppExtractorBase):
         self.logger.debug(f"part tab: {partTabQ}")
         return partTabQ
 
+    @staticmethod
+    def _as_relation_list(result):
+        """Normalise a FromClause.doJob result to a list of relation names.
+
+        FromClause.doActualJob returns its core_relations list on success, but
+        Base.doJob swallows an empty-result UnmasqueError (ERROR_006) and returns
+        the status string OK ("OK "), and returns False / an exception string on
+        other failures. For a UNION of disjoint single-table branches an EMPTY
+        common-table set is the EXPECTED outcome (no relation appears in every
+        arm), so a non-list result here is "no relations", not an error. Returning
+        it verbatim lets the caller's set()/iteration char-split a string into junk
+        relation names ({'O','K',' '} from "OK ") that then poison every branch
+        partition in algorithm1.algo. Collapse any non-list result to [].
+        """
+        return result if isinstance(result, list) else []
+
     def get_fromTabs(self, QH):
         if self.fromtabs is None:
-            self.fromtabs = self.fromClause.doJob(QH, FromClause.TYPE_ERROR)
+            self.fromtabs = self._as_relation_list(self.fromClause.doJob(QH, FromClause.TYPE_ERROR))
         self.logger.debug(str(self.fromtabs))
         return self.fromtabs
 
     def get_comTabs(self, QH, tabs):
         if self.comtabs is None:
             self.fromClause.set_check_relations(tabs)
-            self.comtabs = self.fromClause.doJob(QH, FromClause.TYPE_RENAME)
+            self.comtabs = self._as_relation_list(self.fromClause.doJob(QH, FromClause.TYPE_RENAME))
             self.fromClause.reset_check_relations()
         return self.comtabs
 

@@ -39,6 +39,7 @@ from typing import Dict, List, Set, Tuple
 from ..util.instance import Instance, make_alias
 from ..util.utils import get_format, get_unused_dummy_val
 from ..core.abstract.un2_where_clause import UN2WhereClause
+from .row_probe import RowProbe
 
 
 # Ratio band for B_dup / B_orig. m=2, k=2 → expected 4. Tight enough to
@@ -83,6 +84,8 @@ class CardinalityProbe(UN2WhereClause):
         # swap-symmetric cross-alias join edges on cross-column self-joins.
         self.qh_cols_by_table: Dict[str, Set[str]] = {}
         self._attrib_types: Dict[Tuple[str, str], str] = {}
+        # Enabler S2: shared duplicate-by-ctid / delete-by-ctid / count helper.
+        self._row_probe = RowProbe(self.connectionHelper, self.app, self.logger)
 
     def do_init(self):
         # Pull column types from information_schema so get_datatype works
@@ -191,25 +194,12 @@ class CardinalityProbe(UN2WhereClause):
         return max(0, len(res) - 1)
 
     def _insert_duplicate(self, fqn: str) -> List[str]:
-        sql = f"INSERT INTO {fqn} SELECT * FROM {fqn} RETURNING ctid::text;"
-        try:
-            res, _ = self.connectionHelper.execute_sql_fetchall(sql, self.logger)
-        except Exception as e:
-            self.logger.debug(f"CardinalityProbe: INSERT…RETURNING failed for {fqn}: {e}")
-            return []
-        if not res:
-            return []
-        return [str(row[0]) for row in res]
+        # Enabler S2: duplicate every current row of `fqn` (self-join case).
+        return self._row_probe.duplicate_rows(fqn)
 
     def _delete_rows_at_ctids(self, fqn: str, ctids: List[str]) -> None:
-        for ctid in ctids:
-            sql = f"DELETE FROM {fqn} WHERE ctid = '{ctid}';"
-            try:
-                self.connectionHelper.execute_sql([sql], self.logger)
-            except Exception as e:
-                self.logger.error(
-                    f"CardinalityProbe: failed to delete duplicate at {ctid}: {e}"
-                )
+        # Enabler S2: revert the duplicate by ctid.
+        self._row_probe.delete_rows(fqn, ctids)
 
     # ---------- promotion: rewire alias / instance state in place ----------
 

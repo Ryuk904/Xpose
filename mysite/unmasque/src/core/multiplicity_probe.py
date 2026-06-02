@@ -15,6 +15,8 @@ so callers can decide whether to escalate (warn, raise, etc.).
 
 from typing import Dict, List, Optional
 
+from .row_probe import RowProbe
+
 
 class MultiplicityProbe:
     """Compares Qh vs Q_E result cardinality as a sanity check."""
@@ -28,25 +30,12 @@ class MultiplicityProbe:
         self.detected_multiplicity: Dict[str, int] = {}
         self.qh_rows: Optional[int] = None
         self.qe_rows: Optional[int] = None
+        # Enabler S2: shared count helper (header-stripping logic factored out).
+        self._row_probe = RowProbe(connectionHelper, app, logger)
 
     def _count_rows(self, query: str) -> int:
-        try:
-            result = self.app.doJob(query)
-        except Exception as e:
-            if self.logger is not None:
-                self.logger.debug(f"MultiplicityProbe: query execution failed: {e}")
-            return -1
-        if result is None:
-            return 0
         # Drop the header row if present (app.doJob returns [header, *rows]).
-        try:
-            n = len(result)
-            if n and isinstance(result[0], (list, tuple)) and \
-                    all(isinstance(c, str) for c in result[0]):
-                return max(0, n - 1)
-            return n
-        except TypeError:
-            return -1
+        return self._row_probe.count_rows(query)
 
     def run(self,
             qh: str,

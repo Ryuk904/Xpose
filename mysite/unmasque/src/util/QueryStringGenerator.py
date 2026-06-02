@@ -7,7 +7,7 @@ from .aoa_utils import remove_item_from_list, find_tables_from_predicate, get_ta
     get_LB, get_op, get_UB, add_item_to_list
 from ..core.factory.ExecutableFactory import ExecutableFactory
 from ..util.Log import Log
-from ..util.constants import COUNT, SUM, max_str_len, AVG, MIN, MAX, ORPHAN_COLUMN
+from ..util.constants import COUNT, COUNT_STAR, COUNT_DISTINCT, SUM, max_str_len, AVG, MIN, MAX, ORPHAN_COLUMN
 from ..util.utils import get_format, get_min_and_max_val
 
 
@@ -131,7 +131,7 @@ class QueryStringGenerator:
     join_map = {('l', 'l'): ' INNER JOIN ', ('l', 'h'): ROJ,
                 ('h', 'l'): LOJ, ('h', 'h'): ' FULL OUTER JOIN '}
 
-    AGGREGATES = [SUM, AVG, MIN, MAX, COUNT]
+    AGGREGATES = [SUM, AVG, MIN, MAX, COUNT, COUNT_DISTINCT]
 
     def __init__(self, connectionHelper):
         self.connectionHelper = connectionHelper
@@ -608,10 +608,32 @@ class QueryStringGenerator:
         for i in range(len(self._workingCopy.global_projected_attributes)):
             elt = self._workingCopy.global_projected_attributes[i]
             if self._workingCopy.global_aggregated_attributes[i][1] != '':
-                if COUNT in self._workingCopy.global_aggregated_attributes[i][1]:
+                if self._workingCopy.global_aggregated_attributes[i][1] == COUNT_STAR:
+                    # COUNT(*) is stored as the literal 'Count(*)' (aggregation.py sets
+                    # ('', COUNT_STAR) for an empty projected attribute) and is already
+                    # valid SQL, so emit it verbatim.
                     elt = self._workingCopy.global_aggregated_attributes[i][1]
+                elif self._workingCopy.global_aggregated_attributes[i][1] == COUNT_DISTINCT:
+                    # WI-06: COUNT(DISTINCT col). The counted column lives on the
+                    # aggregate tuple ([0]); the projected attribute is empty (a
+                    # COUNT has no value-dependency), so we take the column from
+                    # the aggregate tuple rather than from `elt`.
+                    elt = 'Count(distinct ' + self._workingCopy.global_aggregated_attributes[i][0] + ')'
                 else:
-                    elt = self._workingCopy.global_aggregated_attributes[i][1] + '(' + elt + ')'
+                    # Every other aggregate wraps its column, INCLUDING column-COUNT whose
+                    # label is the bare 'Count' (COUNT constant): e.g. Count(o_orderkey),
+                    # Sum(l_quantity). The previous `COUNT in label` substring test wrongly
+                    # matched 'Count(*)' too, and for column-COUNT it short-circuited here,
+                    # dropping the column and emitting an invalid bare 'Count'.
+                    #
+                    # WI-06: a column-COUNT (COUNT(col), detected by the nullable-column
+                    # null-injection probe) has an EMPTY projected attribute, because a
+                    # COUNT has no value-dependency for projection to discover. The
+                    # counted column is carried on the aggregate tuple ([0]) instead, so
+                    # fall back to it when `elt` is empty. (For SUM/AVG/MIN/MAX the
+                    # projected attribute is populated and equals [0], so this is a no-op.)
+                    col = elt if elt else self._workingCopy.global_aggregated_attributes[i][0]
+                    elt = self._workingCopy.global_aggregated_attributes[i][1] + '(' + col + ')'
             elif elt and elt in alias_for_attr:
                 # Bare attribute (no aggregate); qualify with an alias of one
                 # of the FROM-instances that has this attribute, so Postgres
