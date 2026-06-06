@@ -45,6 +45,14 @@ class QueryDetails:
         # dict instead of the (envelope-collapsed) tuple in arithmetic_filters.
         self.disjunctive_ranges = {}
 
+        # WI-36: uncorrelated EXISTS / NOT EXISTS gates. Each entry is
+        # {'tab': <relation>, 'kind': 'EXISTS'|'NOT EXISTS'}. The pipeline pulls
+        # the gate relation OUT of core_relations / instances (so it never reaches
+        # FROM) and declares it here; render emits a `<kind> (SELECT 1 FROM tab
+        # [WHERE <inner preds>])` conjunct in the WHERE clause and excludes the
+        # gate relation's own filter predicates from the outer WHERE.
+        self.exists_gates = []
+
         self.projection_names = []
         self.global_projected_attributes = []
         self.global_groupby_attributes = []
@@ -164,6 +172,17 @@ class QueryStringGenerator:
             self._workingCopy.disjunctive_ranges = dict(value)
         else:
             self._workingCopy.disjunctive_ranges = {}
+
+    @property
+    def exists_gates(self):
+        return self._workingCopy.exists_gates
+
+    @exists_gates.setter
+    def exists_gates(self, value):
+        # WI-36: list of {'tab', 'kind'} declared by the pipeline after it
+        # reclassifies a non-projecting / non-joining / non-scaling core
+        # relation as an uncorrelated EXISTS gate.
+        self._workingCopy.exists_gates = list(value) if value else []
 
     @property
     def select_op(self):
@@ -415,6 +434,34 @@ class QueryStringGenerator:
         self._workingCopy.add_to_where_op(predicate)
         return self.write_query()
 
+    def regenerate_with_disjunctions(self, disjunctive_ranges, carriers=None):
+        """Apply within-attribute OR-of-intervals discovered by the post-
+        Projection gap pass and re-render the query.
+
+        ``disjunctive_ranges`` is ``{(tab, attr): [(lb, ub), ...]}``. The render
+        path (__generate_arithmetic_pure_conjunctions) swaps the enveloping
+        'range' carrier tuple in arithmetic_filters for an OR of BETWEEN
+        clauses. ``carriers`` is a list of ``(tab, attr, lo, hi)`` envelopes to
+        synthesise when Filter emitted none (the both-domain-extremes case,
+        e.g. ``A < 5 OR A > 20``) -- without a carrier tuple the swap has
+        nothing to replace. Regenerates where_op from structured state (like
+        rewrite_for_NEP) so the OR expansion runs, then re-writes the query."""
+        for carrier in (carriers or []):
+            tab, attr, lo, hi = carrier
+            if not self._has_range_carrier(tab, attr):
+                self._workingCopy.arithmetic_filters.append((tab, attr, 'range', lo, hi))
+        self._workingCopy.disjunctive_ranges = dict(disjunctive_ranges) if disjunctive_ranges else {}
+        self._workingCopy.where_op = self.__generate_where_clause()
+        return self.write_query()
+
+    def _has_range_carrier(self, tab, attr):
+        for p in self._workingCopy.arithmetic_filters:
+            if (isinstance(p, (tuple, list)) and len(p) >= 5
+                    and p[0] == tab and p[1] == attr
+                    and str(p[2]).strip().lower() == 'range'):
+                return True
+        return False
+
     def __generate_where_clause(self) -> str:
         predicates = []
         if not len(self._workingCopy.join_edges):
@@ -425,9 +472,47 @@ class QueryStringGenerator:
 
         self.__generate_arithmetic_pure_conjunctions(predicates)
 
+        # WI-36: append `<kind> (SELECT 1 FROM gate [WHERE <inner preds>])` for
+        # each reclassified uncorrelated EXISTS / NOT EXISTS gate. The gate's
+        # own filter predicates were excluded from the outer conjunctions above
+        # (they belong inside the subquery) and are rendered here instead.
+        self.__generate_exists_gate_clauses(predicates)
+
         where_clause = "\n and ".join(predicates)
         self.logger.debug(where_clause)
         return where_clause
+
+    def __gate_tables(self) -> set:
+        return {g['tab'] for g in (self._workingCopy.exists_gates or [])}
+
+    def __generate_exists_gate_clauses(self, predicates) -> None:
+        gates = self._workingCopy.exists_gates or []
+        for gate in gates:
+            tab = gate['tab']
+            kind = gate.get('kind', 'EXISTS')
+            inner_preds = self.__collect_gate_inner_predicates(tab)
+            sub = f"SELECT 1 FROM {tab}"
+            if inner_preds:
+                sub = f"{sub} WHERE " + " and ".join(inner_preds)
+            predicates.append(f"{kind} ({sub})")
+
+    def __collect_gate_inner_predicates(self, tab) -> list:
+        # The gate relation's filter tuples ARE its subquery's WHERE clause.
+        # Render them with the same per-predicate renderer used for the outer
+        # WHERE so `region.r_regionkey >= 3` resolves against the subquery FROM.
+        rendered = []
+        source = (self._workingCopy.filter_in_predicates
+                  + self._workingCopy.arithmetic_filters
+                  + self._workingCopy.filter_not_in_predicates)
+        for pred in source:
+            if not (isinstance(pred, (tuple, list)) and len(pred) >= 2):
+                continue
+            if pred[0] != tab:
+                continue
+            p = self.formulate_predicate_from_filter(pred)
+            if p:
+                rendered.append(p)
+        return rendered
 
     def formulate_query_string(self):
         # Phase 6: emit `base alias` syntax when the pipeline supplied alias-
@@ -553,7 +638,16 @@ class QueryStringGenerator:
         disj_ranges = getattr(self._workingCopy, 'disjunctive_ranges', None) or {}
         rendered_disjunctions = set()
 
+        # WI-36: a reclassified EXISTS-gate relation's own filter predicates
+        # belong inside its subquery, not in the outer WHERE (the relation is
+        # no longer in FROM, so an outer `gate.col ...` reference would be an
+        # invalid missing-FROM-entry). Skip them here; __generate_exists_gate_clauses
+        # renders them inside the EXISTS subquery.
+        gate_tabs = self.__gate_tables()
+
         for a_eq in apc_predicates:
+            if gate_tabs and isinstance(a_eq, (tuple, list)) and len(a_eq) >= 1 and a_eq[0] in gate_tabs:
+                continue
             is_range_tuple = (isinstance(a_eq, (tuple, list)) and len(a_eq) >= 5
                               and str(a_eq[2]).strip().lower() == 'range')
             key = (a_eq[0], a_eq[1]) if is_range_tuple else None

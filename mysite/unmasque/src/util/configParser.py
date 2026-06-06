@@ -4,8 +4,8 @@ from pathlib import Path
 from .application_type import ApplicationType
 from .constants import DATABASE_SECTION, HOST, PORT, USER, PASSWORD, SCHEMA, DBNAME, \
     SUPPORT_SECTION, LEVEL, LOGGING_SECTION, FEATURE_SECTION, DETECT_UNION, DETECT_NEP, USE_CS2, DATABASE, DETECT_OR, \
-    DETECT_OJ, DETECT_GAP_AWARE, DETECT_COUNT_DISTINCT, LIMIT, OPTIONS_SECTION, DOWN_SCALE, WORKING_SCHEMA, \
-    TABLE_SIZE_SECTION, TABLE, SCALE_FACTOR, SCALE_RETRY, USE_INDEX
+    DETECT_OJ, DETECT_GAP_AWARE, DETECT_COUNT_DISTINCT, DETECT_EXISTS, LIMIT, OPTIONS_SECTION, DOWN_SCALE, \
+    WORKING_SCHEMA, TABLE_SIZE_SECTION, TABLE, SCALE_FACTOR, SCALE_RETRY, USE_INDEX
 
 
 class Config:
@@ -42,6 +42,7 @@ class Config:
         self.detect_oj = True  # WI-11: outer-join routing is ON by default
         self.detect_gap_aware = False
         self.detect_count_distinct = False
+        self.detect_exists = False  # WI-36: uncorrelated EXISTS gate, OFF by default
         self.use_cs2 = False
         self.scale_down = False
         self.app_type = ApplicationType.SQL_ERR_FWD
@@ -130,6 +131,12 @@ class Config:
             self.detect_count_distinct = detect_count_distinct.lower() == "yes"
         except Exception:
             self.detect_count_distinct = False
+
+        try:
+            detect_exists = config_object.get(FEATURE_SECTION, DETECT_EXISTS)
+            self.detect_exists = detect_exists.lower() == "yes"
+        except Exception:
+            self.detect_exists = False
 
         self.load_optionals(config_object)
 

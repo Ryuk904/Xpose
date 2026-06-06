@@ -1454,4 +1454,214 @@ non-latent correctness demo.
 
 ---
 
+## WI-36 — Uncorrelated EXISTS / NOT EXISTS gate            ✅ DONE (2026-06-03)
+
+### Problem (the "before")
+
+An *uncorrelated* `EXISTS` gate in the WHERE clause references a relation that contributes **no
+projected output column and no join edge** to the outer query — it only gates the whole result on
+its (filtered) non-emptiness:
+
+```sql
+SELECT n_name FROM nation WHERE EXISTS (SELECT 1 FROM region WHERE r_regionkey > 2)
+```
+
+The FROM-clause stage classifies a relation as *core* by removing it and checking whether `Qh`
+goes empty / errors ([`from_clause.py`](mysite/unmasque/src/core/from_clause.py)). For an `EXISTS`
+gate, removing `region` makes the subquery unsatisfiable — `EXISTS` false → 0 rows (or, under the
+default error-forwarding app type, a "relation does not exist" error) — so `region` is **correctly
+swept into `core_relations`**. But `core_relations` then flows verbatim into the mutation pipeline
+and finally into `q_generator.from_clause`, where
+[`QueryStringGenerator`](mysite/unmasque/src/util/QueryStringGenerator.py) comma-joins every core
+relation into the FROM list. The gate is therefore emitted as an unconstrained extra FROM table —
+a **wrong cross join**.
+
+*Concrete before:* the query above reconstructed as `Select n_name From nation, region Where
+region.r_regionkey >= 3` — a cross product (25 × |{regionkeys ≥ 3}| = 50 rows) instead of the
+gated 25.
+
+### Approach (black-box theory)
+
+Nothing here reads the query text. The gate is identified among the core relations by four
+mutation-grounded conditions; a core relation `T` is an uncorrelated `EXISTS` gate **iff all** hold:
+
+1. **Load-bearing** — emptying/removing `T` makes `Qh` empty. Already true by construction: that is
+   exactly why `from_clause` kept `T` as core.
+2. **Non-projecting** — no projected output column is attributed to `T`. Read from
+   `Projection.dependencies` (the per-relation `(tab, attr)` attribution; `projected_attribs`
+   itself stores only the column name). A gate projects nothing.
+3. **Non-joining** — no equi-join edge (`aoa.algebraic_eq_predicates`) and no AOA/theta edge
+   (`aoa.aoa_predicates` / `aoa.aoa_less_thans`) touches `T`. A gate joins nothing.
+4. **NON-SCALING** — the decisive discriminator vs a **CROSS JOIN** (WI-20), which *also* empties
+   the result when emptied and *also* projects/joins nothing. On the single-witness instance `D¹`,
+   duplicate one contributing row of `T` (shared enabler S2,
+   [`RowProbe`](mysite/unmasque/src/core/row_probe.py)) and recount `Qh`:
+
+   | mutation | cross / inner join | `EXISTS` gate |
+   |---|---|---|
+   | duplicate one `T` row | `\|Qh\|` **grows** (~×(rows added)) | `\|Qh\|` **unchanged** (0/1 switch, already open) |
+
+   A cross join pairs every outer row with the new inner row, so the result scales; an `EXISTS`
+   gate was already satisfied and stays satisfied, so the row count is invariant. **Unchanged ⇒
+   gate; grows ⇒ cross/inner join.**
+
+The false-positive direction (emitting `EXISTS` for something that is really a cross join or an
+inner join → wrong result) is closed by requiring *all four*: (2)+(3) rule out a projected/joined
+table, and (4) rules out the cross join. Any inconclusive verdict — `Qh` unreadable, empty witness,
+duplicate failed — or any exception **fails closed**: `T` stays in `core_relations` (the status-quo
+comma-FROM). The gate's inner predicate is recovered for free: the filter stage already mutates
+`T`'s columns and finds the boundary at which `Pop` flips (pushing every `T` row out of the
+subquery predicate → gate false → empty), so the filter tuples on `T`'s columns **are** the
+subquery's WHERE — WI-36 simply scopes them into the subquery instead of the outer WHERE.
+
+The risk flagged in planning — that the View Minimizer might not retain a `T` row satisfying the
+inner predicate — does not arise: `Qh` is non-empty on `D¹` by construction of a successful
+minimization, and a non-empty `EXISTS`-gated result *requires* a satisfying `T` row, so `D¹`'s
+witness for `T` is always a satisfying row.
+
+### Implementation
+
+**Detection.** [`ExistsGateProbe`](mysite/unmasque/src/core/exists_gate_probe.py) — a
+`GenerationPipeLineBase` subclass modelled on WI-14's `SetOpProbe`, owning condition (4):
+`set_data_schema()` + `do_init()` reset to `D¹` (so a prior stage's leftover inserts, e.g. the
+Limit probe's, don't perturb the count), count `Qh`, duplicate one `T` row via `RowProbe`, recount,
+revert in a `finally`. `c1 == c0` → gate (`True`); `c1 > c0` → join (`False`); else undecided
+(`None`). Conditions (1)–(3) and the reclassification loop live in
+[`ExtractionPipeLine`](mysite/unmasque/src/pipeline/ExtractionPipeLine.py)
+(`_reclassify_exists_gates` → `__reclassify_exists_gates_impl`, `_gate_projected_tables`,
+`_gate_joined_tables`, `_strip_gate_relations`), run right after the Limit stage. On a gate verdict
+`T` is removed from `core_relations`, `instances`, and `alias_to_table` so it never reaches FROM.
+The whole pass is wrapped to fail closed.
+
+**Emission.** New `exists_gates` field on the query generator (`QueryDetails.exists_gates` +
+property, plumbed exactly like `disjunctive_ranges`). `__generate_where_clause` appends a
+`<kind> (SELECT 1 FROM T [WHERE <inner preds>])` conjunct (`__generate_exists_gate_clauses` /
+`__collect_gate_inner_predicates`, reusing the existing `formulate_predicate_from_filter` for the
+inner WHERE), and `__generate_arithmetic_pure_conjunctions` **skips any predicate whose table is a
+gate** — those tuples belong inside the subquery, and `T` is no longer in FROM, so an outer
+`T.col ...` reference would be an invalid missing-FROM-entry. No new top-level QSG slot is needed:
+an `EXISTS` gate is a WHERE conjunct.
+
+**Flag.** `exists` ([config.ini](mysite/config.ini) `[feature]`, default **OFF**; `DETECT_EXISTS`
+in [constants.py](mysite/unmasque/src/util/constants.py); `detect_exists` in
+[configParser.py](mysite/unmasque/src/util/configParser.py)) — off by default because it costs
+extra probes and carries a correlated-subquery false-positive risk.
+
+### Proof / verification
+
+**(a) Unit — [`ExistsGateTest.py`](mysite/unmasque/test/ExistsGateTest.py), 26 cases on the REAL
+methods** (fake `app` scripting `|Qh|`, fake `RowProbe`, `unittest.mock` for the injected probe;
+DB-touching `__init__` bypassed via `__new__`):
+
+```
+ExistsGateProbe.is_nonscaling_gate : 1->1 gate; 1->2 / 1->4 join; empty-witness / baseline-fail /
+                                     dup-fail / post-dup-fail / not-core -> undecided; dup reverted
+_gate_projected_tables / _gate_joined_tables : dependencies + aggregated cols; equi + AOA edges;
+                                     constant AOA nodes skipped; real-PGAOcontext regression guard
+_reclassify_exists_gates : gate stripped; scaling/inconclusive kept; flag-off / single-relation
+                                     no-op; joined relation excluded before probing; never strips last
+QSG __generate_where_clause : EXISTS / NOT EXISTS rendered; gate predicate moved into subquery and
+                                     removed from outer WHERE; no-inner-pred; no-gate unchanged
+```
+`python -m unittest mysite.unmasque.test.ExistsGateTest` → **Ran 26 tests … OK**; the full
+regression sweep (CountRender, CountDistinctAgg, SetOpDedup, OuterJoinRoute/ResultSame,
+GroupByConst1, RowProbe, LimitSearch) stays green.
+
+**(b) End-to-end on live TPC-H** (`exists=yes`, `detect_oj=off` so the plain `ExtractionPipeLine`
+runs, `gap_aware=off`, each run its own process). All three **`correct=True`** (bag-equality over
+full `D`):
+
+```
+EXISTS (the deliverable):
+  Qh : select n_name from nation where exists (select 1 from region where r_regionkey > 2)
+  Q_E: Select n_name From nation Where EXISTS (SELECT 1 FROM region WHERE region.r_regionkey >= 3);
+  trace: ExistsGateProbe: region duplicate left |Qh| unchanged (1 -> 1) => EXISTS gate
+
+CROSS-JOIN control (must NOT be EXISTS):
+  Qh : select n_name from nation, region
+  Q_E: Select n_name From nation, region;          (comma-FROM kept)
+  trace: ExistsGateProbe: region duplicate scaled |Qh| (1 -> 2) => cross/inner join
+
+NOT EXISTS:
+  Qh : select n_name from nation where not exists (select 1 from region where r_regionkey > 9)
+  Q_E: Select n_name From nation Where EXISTS (SELECT 1 FROM region WHERE region.r_regionkey <= 9);
+```
+
+The control is the proof of condition (4): the **same** `region` relation — non-projecting and
+non-joining in both queries — is classified a gate (`1→1`) in the first and a cross join (`1→2`) in
+the second. The `CardinalityProbe` independently logged `region B_dup=1 ratio=1.00` (non-scaling)
+in the gate runs, corroborating the signal. `public.*` was intact (orders 1,500,000; lineitem
+6,001,215) before and after all three; 0 orphaned backends.
+
+### Findings & limits
+
+**NOT EXISTS is reconstructed result-correct, not invisible — and this corrects the plan.** The
+checklist predicted NOT EXISTS would be invisible to `from_clause` ("emptying `T` changes nothing").
+That assumed the *void* method, but the default app type is `SQL_ERR_FWD`, so `from_clause` uses the
+**error** method: it renames the relation away and a referenced subquery relation then errors
+(`relation "region" does not exist`) ⇒ core — for **both** EXISTS and NOT EXISTS. So the NOT EXISTS
+gate relation is **kept core**. The filter then recovers the **complement** of the inner predicate
+(the witness must *fail* the inner predicate for the gate to be open: `> 9` ⇒ recovered `<= 9`), and
+WI-36 emits a positive `EXISTS(¬P)`. This is **bag-equivalent on the extraction database for every
+extractable NOT EXISTS gate**: an uncorrelated `NOT EXISTS(P)` yields a non-empty outer result only
+when *no* `T` row satisfies `P` (∀¬P), under which `EXISTS(¬P)` is likewise true (T non-empty). So
+WI-36 produces a **result-correct** query but does **not recover the polarity** — `EXISTS` vs
+`NOT EXISTS` is unobservable on the single witness `D¹` (the witness satisfies the recovered
+predicate either way), and the emitted `EXISTS(¬P)` would diverge from `NOT EXISTS(P)` on a database
+where `T`'s rows *straddle* `P`. A clean polarity probe is specified for future work: INSERT a `T`
+row that *violates* the recovered predicate `Q` (satisfies `¬Q`); under `EXISTS(Q)` the witness keeps
+the gate open (`|Qh|` unchanged), under `NOT EXISTS(¬Q)` the inserted row closes it (`|Qh|` → 0);
+then emit `NOT EXISTS(¬Q)`.
+
+Other honest limits:
+
+- **Correlated EXISTS is Infeasible.** On `D¹` the correlation column holds a fixed witness value,
+  so the filter records it as a constant `=` predicate, making a correlated gate indistinguishable
+  from an uncorrelated one. The default-OFF flag mitigates the resulting false-positive risk.
+- **Semi-join to a UNIQUE key that every outer row matches** is result-equivalent to an inner join
+  on many `D` — but such a gate carries a join edge, so it **fails condition (3)** and is kept as a
+  join (no spurious `EXISTS`). The win is scoped to gates that are *not* join-equivalent on the test
+  `D`.
+- **A blanket global aggregate** (COUNT/SUM with no GROUP BY) collapses `|Qh|` to one row, defeating
+  the row-count signal of condition (4) — but such queries typically also defeat `from_clause`'s
+  emptiness classifier (a `COUNT(*)` always returns a row), so they rarely reach this stage.
+- **A latent dev bug worth recording:** `_gate_projected_tables` first read `PGAOcontext.aggregate`,
+  which is a *write-only* property whose getter `raise NotImplementedError` — and `getattr(..., None)`
+  does **not** suppress `NotImplementedError` (only `AttributeError`). It propagated and aborted the
+  whole extraction (empty `Q_E`) even though detection is otherwise fail-closed. Fixed to read the
+  concrete `aggregated_attributes`, with a real-`PGAOcontext` regression test. Lesson: `getattr` with
+  a default is not a safe probe against a property whose getter can raise.
+- **Pipeline composition:** verified under the plain `ExtractionPipeLine`. Composing with the
+  `OuterJoinPipeLine` post-processor (which independently rebuilds FROM from `genPipelineCtx`, still
+  holding the gate) is future integration — there is no shipped-default conflict because `exists` is
+  OFF by default.
+
+### Where it lives
+
+- Detection: [`exists_gate_probe.py`](mysite/unmasque/src/core/exists_gate_probe.py) (condition 4);
+  [`ExtractionPipeLine`](mysite/unmasque/src/pipeline/ExtractionPipeLine.py) `_reclassify_exists_gates`
+  & helpers (conditions 1–3 + reclassification + gate stripping); built on
+  [`RowProbe`](mysite/unmasque/src/core/row_probe.py) (S2).
+- Emission: [`QueryStringGenerator`](mysite/unmasque/src/util/QueryStringGenerator.py) — `exists_gates`
+  field/property, `__generate_exists_gate_clauses`, `__collect_gate_inner_predicates`, the gate-table
+  skip in `__generate_arithmetic_pure_conjunctions`.
+- Flag: `exists` ([config.ini](mysite/config.ini), [constants.py](mysite/unmasque/src/util/constants.py),
+  [configParser.py](mysite/unmasque/src/util/configParser.py)), default OFF.
+- Test: [`ExistsGateTest.py`](mysite/unmasque/test/ExistsGateTest.py) (26 cases).
+
+### Thesis takeaway
+
+An `EXISTS` gate and a cross join are *identical* on every channel the pipeline normally uses — both
+are load-bearing, both can project and join nothing, both empty the result when emptied — and they
+separate cleanly only on the **multiplicity** channel: duplicate one contributing row and ask whether
+the result *scales*. It is the same recurring move as WI-05/06/14 (when the single-witness value
+channel is ambiguous, recover the missing bit from a controlled change in cardinality), here applied
+to a *structural* construct rather than an aggregate. The NOT EXISTS result is the report's sharpest
+illustration of the gap between *result-correctness* (bag-equality on the extraction `D`, which WI-36
+achieves for NOT EXISTS via the complement) and *faithful construct recovery* (the `EXISTS` vs
+`NOT EXISTS` polarity, which is genuinely unobservable on a single witness row): the framework can be
+provably right about the answer while structurally wrong about the question.
+
+---
+
 _Append the next item below this line._

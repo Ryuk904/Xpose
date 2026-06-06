@@ -726,13 +726,81 @@ multiplicity-dependent constructs are observable.
 - **Observability limit:** only the scalar-threshold-in-WHERE shape; derived tables and IN/ANY subqueries
   are indistinguishable from base scans / IN-lists under Pop.
 
-### WI-36 — EXISTS / NOT EXISTS (uncorrelated)  `Hard`  ☐
-- **Do:** an uncorrelated EXISTS gate: nullify candidate gate relation T
-  ([`__nullify_relations`](mysite/unmasque/src/pipeline/UnionPipeLine.py#L80)); if Pop flips empty
-  while T supplies no projected/joined columns → EXISTS gate (NOT EXISTS = inverse). Confirm via row-count
-  direction. Needs an EXISTS node in QSG.
-- **Observability limit:** a semi-join to a unique key is observationally equal to an inner join in many `D`;
-  correlated EXISTS is **Infeasible**.
+### WI-36 — EXISTS / NOT EXISTS (uncorrelated)  `Hard`  ✅ DONE (2026-06-03)
+- **Was (☐ plan, anchors STALE):** nullify candidate gate relation T (`__nullify_relations`); if Pop
+  flips empty while T supplies no projected/joined columns → EXISTS gate (NOT EXISTS = inverse). The
+  cited anchor was wrong (the actual classifier is `from_clause.get_core_relations_by_void/by_error`),
+  and the "NOT EXISTS = inverse" framing was also wrong (corrected below).
+- **What shipped — DETECTION.** New [`ExistsGateProbe`](mysite/unmasque/src/core/exists_gate_probe.py)
+  (a `GenerationPipeLineBase` subclass, modelled on WI-14's `SetOpProbe`) owns the decisive
+  **non-scaling** check. Reclassification is driven by
+  [`ExtractionPipeLine._reclassify_exists_gates`](mysite/unmasque/src/pipeline/ExtractionPipeLine.py)
+  (+ `__reclassify_exists_gates_impl`, `_gate_projected_tables`, `_gate_joined_tables`,
+  `_strip_gate_relations`), run right after the Limit stage and before the q_generator is configured.
+  A core relation `T` is an uncorrelated EXISTS gate iff **all four** hold:
+  (1) **load-bearing** — guaranteed by core membership (from_clause kept it);
+  (2) **non-projecting** — `T` is in no `Projection.dependencies` entry (read the per-relation
+      attribution, since `projected_attribs` stores only the column name);
+  (3) **non-joining** — `T` is in no equi-join edge (`aoa.algebraic_eq_predicates`) nor AOA/theta edge
+      (`aoa.aoa_predicates` / `aoa.aoa_less_thans`);
+  (4) **NON-SCALING** — *the decisive discriminator vs a CROSS JOIN* (which also empties the result when
+      emptied): duplicate one contributing `T` row on D¹ (shared S2 [`RowProbe`](mysite/unmasque/src/core/row_probe.py))
+      and recount Qh. **`|Qh|` unchanged ⇒ gate; grows ⇒ cross/inner join** (kept in FROM). Fail-closed:
+      any inconclusive/`None` verdict, or any exception, leaves `T` in core_relations (status quo).
+  On a gate verdict, `T` is pulled out of `core_relations` / `instances` / `alias_to_table` so it never
+  reaches FROM.
+- **What shipped — EMISSION.** New `exists_gates` field on
+  [`QueryStringGenerator`](mysite/unmasque/src/util/QueryStringGenerator.py) (`QueryDetails.exists_gates`
+  + property, plumbed like `disjunctive_ranges`). `__generate_where_clause` appends a
+  `<kind> (SELECT 1 FROM T [WHERE <inner preds>])` conjunct via `__generate_exists_gate_clauses` /
+  `__collect_gate_inner_predicates` (reusing the existing `formulate_predicate_from_filter` for the inner
+  WHERE), and `__generate_arithmetic_pure_conjunctions` now SKIPS any predicate whose tab is a gate (its
+  filter tuples belong inside the subquery, not the outer WHERE — `T` is no longer in FROM). No new
+  top-level QSG slot needed — it's a WHERE conjunct.
+- **Flag:** `exists` ([config.ini](mysite/config.ini) `[feature]`, default **OFF**; `DETECT_EXISTS` in
+  [constants.py](mysite/unmasque/src/util/constants.py); `detect_exists` in
+  [configParser.py](mysite/unmasque/src/util/configParser.py)). Off by default: extra probes + a
+  correlated-subquery false-positive risk.
+- **Verified:** [`ExistsGateTest.py`](mysite/unmasque/test/ExistsGateTest.py) — 26 cases on the REAL
+  methods (probe non-scaling/scaling/undecided/revert; `_gate_projected_tables`/`_gate_joined_tables`;
+  the fail-closed reclassification loop incl. a real-`PGAOcontext` regression guard for the write-only
+  `aggregate` property; QSG EXISTS/NOT-EXISTS/no-inner-pred/no-gate rendering), all green; full
+  regression sweep (CountRender, CountDistinctAgg, SetOpDedup, OuterJoinRoute/ResultSame, GroupByConst1,
+  RowProbe, LimitSearch) green. **E2e on live TPC-H** (`exists=yes`, `detect_oj=off` so the plain
+  ExtractionPipeLine runs, `gap_aware=off`, each own process), all **correct=True**:
+  - **EXISTS (the deliverable):** `select n_name from nation where exists (select 1 from region where
+    r_regionkey > 2)` → `Select n_name From nation Where EXISTS (SELECT 1 FROM region WHERE
+    region.r_regionkey >= 3);` — DEBUG trace: dup region witness `(0,4)` → `|Qh|` **1→1** ⇒ gate, then revert.
+  - **CROSS-JOIN control (must NOT be EXISTS):** `select n_name from nation, region` → `Select n_name
+    From nation, region;` (comma-FROM kept) — probe: region dup `|Qh|` **1→2** ⇒ cross join. Same region
+    relation, opposite verdict — condition (4) is the discriminator.
+  - **NOT EXISTS:** `select n_name from nation where not exists (select 1 from region where r_regionkey >
+    9)` → `Select n_name From nation Where EXISTS (SELECT 1 FROM region WHERE region.r_regionkey <= 9);`.
+  `public.*` intact (orders 1,500,000; lineitem 6,001,215) before/after all three; 0 orphaned backends.
+- **NOT EXISTS — honest finding (corrects the checklist's "= inverse" framing).** The default app_type is
+  `SQL_ERR_FWD`, so from_clause uses the **error method** (rename the relation away → REL_ERROR ⇒ core),
+  not the void method. So the NOT EXISTS gate relation is **kept core** (it is referenced in the subquery)
+  — it is NOT invisible as the original plan assumed. The filter then recovers the **complement** of the
+  inner predicate (the witness must FAIL the inner predicate for the gate to be open: `>9` ⇒ recovered
+  `<=9`), and WI-36 emits a positive `EXISTS(complement)`. This is **bag-equivalent on the extraction D**
+  for *every extractable* NOT EXISTS gate, because an uncorrelated NOT EXISTS(P) yields a non-empty outer
+  result only when **no** T row satisfies P (∀¬P), under which EXISTS(¬P) is likewise true. WI-36 therefore
+  reconstructs a **result-correct** query but does NOT recover the **polarity** (EXISTS vs NOT EXISTS is
+  unobservable on the single witness D¹ — the witness satisfies the recovered predicate either way), and
+  the emitted EXISTS(¬P) would diverge from NOT EXISTS(P) on a database where T's rows straddle P.
+  **Specified future path** (clean, not yet shipped): a polarity probe — INSERT a T-row that violates the
+  recovered predicate Q (satisfies ¬Q); under EXISTS(Q) the witness keeps the gate open (`|Qh|` unchanged),
+  under NOT EXISTS(¬Q) the inserted row closes it (`|Qh|` → 0) — then emit `NOT EXISTS(¬Q)`.
+- **Observability limits (honest):** (a) **correlated EXISTS** is Infeasible — on D¹ the correlation
+  column has a fixed witness value, so the filter records it as a constant `=` and a correlated gate is
+  indistinguishable from an uncorrelated one (default-OFF flag mitigates the false-positive risk).
+  (b) A **semi-join to a UNIQUE key every outer row matches** is result-equivalent to an inner join on many
+  D — but such a gate has a join edge ⇒ fails (3) ⇒ kept as a join (no spurious EXISTS). (c) A blanket
+  global aggregate (COUNT/SUM, no GROUP BY) collapses `|Qh|` to one row, defeating the (4) row-count signal
+  — but such queries typically also defeat from_clause's emptiness classifier, so they rarely reach here.
+  (d) Verified under the plain ExtractionPipeLine; composing with the OuterJoin post-processor (which
+  independently rebuilds FROM from `genPipelineCtx`, still holding the gate) is future integration — no
+  shipped-default conflict since `exists` is OFF by default.
 
 ### WI-37 — Scalar subquery in SELECT  `Hard`  ☐
 - **Do:** a (uncorrelated) scalar subquery is a CONSTANT output column; the projection solver fits it as a
@@ -777,6 +845,8 @@ multiplicity-dependent constructs are observable.
   (datatypes), WI-18 (OFFSET).
 - **Then the rest of Moderate**, then Hard items as standalone projects (WI-22 HAVING and WI-38 CASE are the
   highest-value Hard items).
+- **Hard items landed:** **WI-36 ✅** (uncorrelated EXISTS gate detect+emit; NOT EXISTS reconstructed
+  result-correct as EXISTS-complement, polarity recovery specified as future work).
 
 ---
 
@@ -827,6 +897,38 @@ discussion (what is provably unrecoverable and why) → future work.
 
 ## Progress log (newest first)
 
+- _2026-06-03_ — **WI-36 ✅ DONE (uncorrelated EXISTS gate detect+emit; NOT EXISTS reconstructed
+  result-correct).** New [`ExistsGateProbe`](mysite/unmasque/src/core/exists_gate_probe.py) (modelled on
+  WI-14 `SetOpProbe`) + [`ExtractionPipeLine._reclassify_exists_gates`](mysite/unmasque/src/pipeline/ExtractionPipeLine.py)
+  run after the Limit stage: a core relation that is (1) load-bearing, (2) non-projecting
+  (`Projection.dependencies`), (3) non-joining (`aoa` edges), and (4) **non-scaling** (dup one of its rows
+  via S2 [`RowProbe`](mysite/unmasque/src/core/row_probe.py) → `|Qh|` unchanged ⇒ gate; grows ⇒ cross/inner
+  join) is pulled out of `core_relations`/`instances`/`alias_to_table` and declared as an `exists_gates`
+  entry; QSG appends `EXISTS (SELECT 1 FROM T WHERE <inner preds>)` to the WHERE and excludes T's own filter
+  predicates from the outer WHERE (`__generate_exists_gate_clauses` + gate-tab skip). Condition (4) is the
+  decisive discriminator vs a cross join (WI-20), which also empties the result when emptied but **scales**
+  when a row is duplicated. New `exists` flag (default **OFF**: extra probes + correlated-subquery false-positive
+  risk). Fail-closed throughout (any inconclusive/exception keeps T in FROM). **Discovery that corrects the
+  plan:** the checklist's WI-36 anchor (`__nullify_relations`) was stale, and "NOT EXISTS = inverse" was wrong
+  — the default `SQL_ERR_FWD` app_type means from_clause uses the **error method**, so a NOT EXISTS gate
+  relation is **kept core** (referenced in the subquery), NOT invisible; the filter recovers the **complement**
+  of the inner predicate and WI-36 emits a positive `EXISTS(¬P)` that is bag-equivalent on D for *every
+  extractable* NOT EXISTS (an uncorrelated NOT EXISTS(P) is non-empty only when ∀¬P, under which EXISTS(¬P) is
+  also true). So NOT EXISTS is **result-correct** but its **polarity is not recovered** (unobservable on the
+  single witness D¹); a clean polarity probe (insert a ¬Q-row: gate stays open ⇒ EXISTS, closes ⇒ NOT EXISTS)
+  is specified as future work. **Bug fixed mid-dev:** `_gate_projected_tables` read `PGAOcontext.aggregate`,
+  a write-only property whose getter raises `NotImplementedError` (and `getattr` does NOT suppress it) — it
+  aborted extraction; fixed to read `aggregated_attributes`, with a real-`PGAOcontext` regression test.
+  Verified: [`ExistsGateTest.py`](mysite/unmasque/test/ExistsGateTest.py) (26 cases on the real methods) +
+  full regression sweep green; e2e on live TPC-H all **correct=True** — `exists(region where r_regionkey>2)`
+  → `EXISTS (SELECT 1 FROM region WHERE region.r_regionkey >= 3)` (probe `|Qh|` 1→1); cross-join control
+  `nation, region` → comma-FROM kept (probe `|Qh|` 1→2); `not exists(region where r_regionkey>9)` →
+  `EXISTS (SELECT 1 FROM region WHERE region.r_regionkey <= 9)`. `public.*` intact (orders 1,500,000;
+  lineitem 6,001,215), 0 orphaned backends. Verified under the plain ExtractionPipeLine (`detect_oj=off`);
+  OuterJoin-pipeline composition is future integration (OJ rebuilds FROM from genPipelineCtx). Full writeup in
+  [COVERAGE_EXPANSION_REPORT.md](COVERAGE_EXPANSION_REPORT.md#wi-36--uncorrelated-exists--not-exists-gate).
+  Next suggested: the WI-36 **polarity probe** (faithful NOT EXISTS) or **WI-20** (cross-join confidence flag,
+  shares the S2 scaling primitive), or **WI-10** (cross-attr OR).
 - _2026-06-02_ — **BUGFIX ✅ Union FROM-clause junk-relation (status-string char-split) — unblocks
   single-table UNION branches + the non-latent WI-14 overlap demo.** Root cause: for a bare single-table
   single-column UNION branch the arms share **no** common relation, so

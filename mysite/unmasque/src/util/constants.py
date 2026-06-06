@@ -74,6 +74,13 @@ DETECT_OR = "or"
 DETECT_OJ = "outer_join"
 DETECT_GAP_AWARE = "gap_aware"
 DETECT_COUNT_DISTINCT = "count_distinct"
+DETECT_EXISTS = "exists"
+
+# WI-36: kind markers for an uncorrelated EXISTS / NOT EXISTS gate. Carried on
+# the QueryStringGenerator's exists_gates field and rendered verbatim as the
+# leading keyword of the WHERE-clause conjunct `<kind> (SELECT 1 FROM T ...)`.
+EXISTS_GATE = "EXISTS"
+NOT_EXISTS_GATE = "NOT EXISTS"
 
 
 WAITING = "_WAITING"
